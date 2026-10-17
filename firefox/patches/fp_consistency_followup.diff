@@ -1,0 +1,961 @@
+diff --git a/dom/base/nsGlobalWindowOuter.cpp b/dom/base/nsGlobalWindowOuter.cpp
+index f8428e5..b1f9063 100644
+--- a/dom/base/nsGlobalWindowOuter.cpp
++++ b/dom/base/nsGlobalWindowOuter.cpp
+@@ -3510,6 +3510,42 @@ nsresult nsGlobalWindowOuter::GetInnerHeight(double* aInnerHeight) {
+ 
+ CSSIntSize nsGlobalWindowOuter::GetOuterSize(CallerType aCallerType,
+                                              ErrorResult& aError) {
++  // BROWSER_FINGERPRINT: outer size comes from the top browsing-context
++  // profile when explicitly present. Missing/malformed fields stay native.
++  if (BrowsingContext* bc = GetBrowsingContext()) {
++    const nsString profile = bc->Top()->GetFingerprintProfile();
++    auto readInt = [&profile](const char* key) -> Maybe<int32_t> {
++      nsAutoString pattern;
++      pattern.Append(char16_t('"'));
++      pattern.AppendASCII(key);
++      pattern.Append(char16_t('"'));
++      pattern.Append(char16_t(':'));
++      int32_t position = profile.Find(pattern);
++      if (position < 0) return Nothing();
++      position += pattern.Length();
++      while (position < static_cast<int32_t>(profile.Length()) &&
++             (profile[position] == char16_t(' ') ||
++              profile[position] == char16_t('\t'))) {
++        ++position;
++      }
++      int32_t end = position;
++      while (end < static_cast<int32_t>(profile.Length()) &&
++             profile[end] >= char16_t('0') &&
++             profile[end] <= char16_t('9')) {
++        ++end;
++      }
++      if (end == position) return Nothing();
++      nsresult rv = NS_OK;
++      int32_t value =
++          Substring(profile, position, end - position).ToInteger(&rv);
++      return NS_SUCCEEDED(rv) && value > 0 ? Some(value) : Nothing();
++    };
++    Maybe<int32_t> width = readInt("outerWidth");
++    Maybe<int32_t> height = readInt("outerHeight");
++    if (width && height) {
++      return CSSIntSize(*width, *height);
++    }
++  }
+   if (nsIGlobalObject::ShouldResistFingerprinting(aCallerType,
+                                                   RFPTarget::WindowOuterSize)) {
+     if (BrowsingContext* bc = GetBrowsingContext()) {
+diff --git a/dom/canvas/OffscreenCanvas.cpp b/dom/canvas/OffscreenCanvas.cpp
+index 7234240..785305c 100644
+--- a/dom/canvas/OffscreenCanvas.cpp
++++ b/dom/canvas/OffscreenCanvas.cpp
+@@ -16,6 +16,7 @@
+ #include "mozilla/CheckedInt.h"
+ #include "mozilla/Logging.h"
+ #include "mozilla/dom/BlobImpl.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/DocumentInlines.h"
+ #include "mozilla/dom/OffscreenCanvasBinding.h"
+ #include "mozilla/dom/OffscreenCanvasDisplayHelper.h"
+@@ -723,6 +724,23 @@ Maybe<FontVisibility> OffscreenCanvas::MaybeInheritFontVisibility() const {
+   return Some(worker->GetFontVisibility());
+ }
+ 
++void OffscreenCanvas::CopyFingerprintProfile(nsAString& aProfile) const {
++  aProfile.Truncate();
++  if (NS_IsMainThread()) {
++    nsCOMPtr<nsPIDOMWindowInner> window =
++        do_QueryInterface(GetRelevantGlobal());
++    if (Document* document = window ? window->GetExtantDoc() : nullptr) {
++      if (BrowsingContext* context = document->GetBrowsingContext()) {
++        aProfile.Assign(context->Top()->GetFingerprintProfile());
++      }
++    }
++    return;
++  }
++  if (WorkerPrivate* worker = GetCurrentThreadWorkerPrivate()) {
++    aProfile.Assign(worker->GetFingerprintProfile());
++  }
++}
++
+ void OffscreenCanvas::UserFontSetUpdated(gfxUserFontEntry*) {}
+ 
+ NS_IMPL_CYCLE_COLLECTION_INHERITED(OffscreenCanvas, DOMEventTargetHelper,
+diff --git a/dom/canvas/OffscreenCanvas.h b/dom/canvas/OffscreenCanvas.h
+index 46f4376..08a4446 100644
+--- a/dom/canvas/OffscreenCanvas.h
++++ b/dom/canvas/OffscreenCanvas.h
+@@ -73,6 +73,7 @@ class OffscreenCanvas final : public DOMEventTargetHelper,
+   IMPL_EVENT_HANDLER(contextrestored);
+ 
+   FONT_VISIBILITY_PROVIDER_IMPL
++  void CopyFingerprintProfile(nsAString& aProfile) const override;
+ 
+   OffscreenCanvas(nsIGlobalObject* aGlobal, uint32_t aWidth, uint32_t aHeight);
+ 
+diff --git a/dom/media/MediaDevices.cpp b/dom/media/MediaDevices.cpp
+index 54e4d48..ca6917c 100644
+--- a/dom/media/MediaDevices.cpp
++++ b/dom/media/MediaDevices.cpp
+@@ -5,6 +5,9 @@
+ #include "mozilla/dom/MediaDevices.h"
+ 
+ #include "AudioDeviceInfo.h"
++#include "js/Array.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ #include "MediaEngine.h"
+ #include "MediaEngineFake.h"
+ #include "MediaTrackConstraints.h"
+@@ -19,6 +22,7 @@
+ #include "mozilla/dom/MediaTrackSupportedConstraintsBinding.h"
+ #include "mozilla/dom/NavigatorBinding.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/WindowContext.h"
+ #include "mozilla/intl/Localization.h"
+ #include "nsContentUtils.h"
+@@ -168,6 +172,94 @@ RefPtr<MediaDevices::StreamPromise> MediaDevices::GetUserMedia(
+           });
+ }
+ 
++static bool MaybeResolveFingerprintMediaDevices(
++    nsPIDOMWindowInner* aWindow, Promise* aPromise) {
++  BrowsingContext* context =
++      aWindow ? aWindow->GetBrowsingContext() : nullptr;
++  if (!context) {
++    return false;
++  }
++  const nsString fingerprint =
++      context->Top()->GetFingerprintProfile();
++  if (fingerprint.IsEmpty()) {
++    return false;
++  }
++
++  nsTArray<RefPtr<MediaDeviceInfo>> infos;
++  bool configured = false;
++  {
++    AutoJSAPI jsapi;
++    if (!jsapi.Init(aWindow)) {
++      return false;
++    }
++    JSContext* cx = jsapi.cx();
++    JS::Rooted<JS::Value> root(cx);
++    if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                     &root) &&
++        root.isObject()) {
++      JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++      JS::Rooted<JS::Value> devices(cx);
++      if (JS_GetProperty(cx, rootObject, "mediaDevices", &devices) &&
++          devices.isObject()) {
++        JS::Rooted<JSObject*> array(cx, &devices.toObject());
++        bool isArray = false;
++        uint32_t length = 0;
++        if (JS::IsArrayObject(cx, array, &isArray) && isArray &&
++            JS::GetArrayLength(cx, array, &length)) {
++          configured = true;
++          auto getString = [cx](JS::Handle<JSObject*> object,
++                                const char* key,
++                                nsAString& output) -> bool {
++            JS::Rooted<JS::Value> value(cx);
++            if (!JS_GetProperty(cx, object, key, &value) ||
++                !value.isString()) {
++              return false;
++            }
++            nsAutoJSString stringValue;
++            if (!stringValue.init(cx, value.toString())) return false;
++            output.Assign(stringValue);
++            return true;
++          };
++          for (uint32_t i = 0; i < length; ++i) {
++            JS::Rooted<JS::Value> entry(cx);
++            if (!JS_GetElement(cx, array, i, &entry) ||
++                !entry.isObject()) {
++              continue;
++            }
++            JS::Rooted<JSObject*> object(cx, &entry.toObject());
++            nsAutoString kindString;
++            nsAutoString id;
++            nsAutoString label;
++            nsAutoString group;
++            if (!getString(object, "kind", kindString)) continue;
++            getString(object, "deviceId", id);
++            getString(object, "label", label);
++            getString(object, "groupId", group);
++            MediaDeviceKind kind;
++            if (kindString.EqualsLiteral("audioinput")) {
++              kind = MediaDeviceKind::Audioinput;
++            } else if (kindString.EqualsLiteral("videoinput")) {
++              kind = MediaDeviceKind::Videoinput;
++            } else if (kindString.EqualsLiteral("audiooutput")) {
++              kind = MediaDeviceKind::Audiooutput;
++            } else {
++              continue;
++            }
++            infos.AppendElement(
++                MakeRefPtr<MediaDeviceInfo>(id, kind, label, group));
++          }
++        }
++      }
++    }
++    JS_ClearPendingException(cx);
++  }
++  if (!configured) {
++    return false;
++  }
++  aPromise->MaybeResolve(std::move(infos));
++  return true;
++}
++
+ already_AddRefed<Promise> MediaDevices::EnumerateDevices(ErrorResult& aRv) {
+   MOZ_ASSERT(NS_IsMainThread());
+   nsCOMPtr<nsIGlobalObject> global = xpc::NativeGlobal(GetWrapper());
+@@ -186,6 +278,12 @@ already_AddRefed<Promise> MediaDevices::EnumerateDevices(ErrorResult& aRv) {
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
++  // BROWSER_FINGERPRINT: an explicit device matrix is a complete per-context
++  // enumeration view. Resolve it before Gecko's focus/physical-device gate;
++  // permissions and getUserMedia remain native.
++  if (MaybeResolveFingerprintMediaDevices(owner, p)) {
++    return p.forget();
++  }
+   mPendingEnumerateDevicesPromises.AppendElement(p);
+   MaybeResumeDeviceExposure();
+   return p.forget();
+@@ -508,6 +606,7 @@ void MediaDevices::ResolveEnumerateDevicesPromise(
+         exposeLabel ? device->mName : u""_ns,
+         exposeInfo ? device->mGroupID : u""_ns));
+   }
++
+   aPromise->MaybeResolve(std::move(infos));
+ }
+ 
+diff --git a/dom/media/mediacapabilities/MediaCapabilities.cpp b/dom/media/mediacapabilities/MediaCapabilities.cpp
+index 5a44fe3..632f5cb 100644
+--- a/dom/media/mediacapabilities/MediaCapabilities.cpp
++++ b/dom/media/mediacapabilities/MediaCapabilities.cpp
+@@ -22,12 +22,14 @@
+ #include "mozilla/StaticPrefs_media.h"
+ #include "mozilla/TaskQueue.h"
+ #include "mozilla/dom/DOMMozPromiseRequestHolder.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/MediaCapabilitiesBinding.h"
+ #include "mozilla/dom/MediaKeySystemAccess.h"
+ #include "mozilla/dom/MediaSource.h"
+ #include "mozilla/dom/Navigator.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/WorkerCommon.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/WorkerRef.h"
+@@ -36,9 +38,103 @@
+ #include "mozilla/media/webrtc/CodecInfo.h"
+ #include "nsContentUtils.h"
+ #include "nsIPrincipal.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ 
+ namespace mozilla::dom {
+ enum class CodecSupport : uint8_t { Supported, Unsupported, Unknown };
++
++static bool MaybeResolveFingerprintDecodingInfo(
++    nsIGlobalObject* aParent,
++    const MediaDecodingConfiguration& aConfiguration,
++    Promise* aPromise) {
++  if (aConfiguration.mKeySystemConfiguration.WasPassed()) {
++    return false;
++  }
++  nsAutoString fingerprint;
++  if (auto* window = aParent->GetAsInnerWindow()) {
++    if (Document* document = window->GetExtantDoc()) {
++      if (BrowsingContext* context = document->GetBrowsingContext()) {
++        fingerprint = context->Top()->GetFingerprintProfile();
++      }
++    }
++  } else if (WorkerPrivate* worker = GetCurrentThreadWorkerPrivate()) {
++    fingerprint = worker->GetFingerprintProfile();
++  }
++  if (fingerprint.IsEmpty()) {
++    return false;
++  }
++
++  bool configured = false;
++  bool supported = true;
++  bool smooth = true;
++  bool powerEfficient = true;
++  {
++    AutoJSAPI jsapi;
++    if (!jsapi.Init(aParent)) {
++      return false;
++    }
++    JSContext* cx = jsapi.cx();
++    JS::Rooted<JS::Value> root(cx);
++    if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                     &root) &&
++        root.isObject()) {
++      JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++      JS::Rooted<JS::Value> mediaCodecs(cx);
++      JS::Rooted<JS::Value> decodingInfo(cx);
++      if (JS_GetProperty(cx, rootObject, "mediaCodecs", &mediaCodecs) &&
++          mediaCodecs.isObject()) {
++        JS::Rooted<JSObject*> mediaCodecsObject(
++            cx, &mediaCodecs.toObject());
++        if (JS_GetProperty(cx, mediaCodecsObject, "decodingInfo",
++                           &decodingInfo) &&
++            decodingInfo.isObject()) {
++          JS::Rooted<JSObject*> matrix(cx, &decodingInfo.toObject());
++          auto merge = [&](const nsAString& contentType) {
++            NS_ConvertUTF16toUTF8 key(contentType);
++            JS::Rooted<JS::Value> entry(cx);
++            if (!JS_GetProperty(cx, matrix, key.get(), &entry) ||
++                !entry.isObject()) {
++              return false;
++            }
++            JS::Rooted<JSObject*> object(cx, &entry.toObject());
++            JS::Rooted<JS::Value> supportedValue(cx);
++            JS::Rooted<JS::Value> smoothValue(cx);
++            JS::Rooted<JS::Value> powerValue(cx);
++            if (!JS_GetProperty(cx, object, "supported", &supportedValue) ||
++                !supportedValue.isBoolean() ||
++                !JS_GetProperty(cx, object, "smooth", &smoothValue) ||
++                !smoothValue.isBoolean() ||
++                !JS_GetProperty(cx, object, "powerEfficient", &powerValue) ||
++                !powerValue.isBoolean()) {
++              return false;
++            }
++            supported &= supportedValue.toBoolean();
++            smooth &= smoothValue.toBoolean();
++            powerEfficient &= powerValue.toBoolean();
++            return true;
++          };
++          configured =
++              (!aConfiguration.mAudio.WasPassed() ||
++               merge(aConfiguration.mAudio.Value().mContentType)) &&
++              (!aConfiguration.mVideo.WasPassed() ||
++               merge(aConfiguration.mVideo.Value().mContentType));
++        }
++      }
++    }
++    JS_ClearPendingException(cx);
++  }
++  if (!configured) {
++    return false;
++  }
++  MediaCapabilitiesDecodingInfo info;
++  info.mSupported = supported;
++  info.mSmooth = smooth;
++  info.mPowerEfficient = powerEfficient;
++  aPromise->MaybeResolve(std::move(info));
++  return true;
++}
++
+ static const char* EnumValueToString(const CodecSupport& aEnum) {
+   static constexpr const char* kStrings[] = {"Supported", "Unsupported",
+                                              "Unknown"};
+@@ -700,6 +796,10 @@ already_AddRefed<Promise> MediaCapabilities::DecodingInfo(
+   }
+ 
+   // Step 3: Let p be a new Promise (already have it!)
++  if (MaybeResolveFingerprintDecodingInfo(
++          mParent, aConfiguration, promise)) {
++    return promise.forget();
++  }
+   // Step 4: In parallel, run the Create a MediaCapabilitiesDecodingInfo
+   //         algorithm with configuration and resolve p with its result.
+   CreateMediaCapabilitiesDecodingInfo(aConfiguration, aRv, promise, behavior);
+diff --git a/dom/media/mediaelement/HTMLMediaElement.cpp b/dom/media/mediaelement/HTMLMediaElement.cpp
+index b4ab162..c11a819 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.cpp
++++ b/dom/media/mediaelement/HTMLMediaElement.cpp
+@@ -51,6 +51,7 @@
+ #include "VideoStreamTrack.h"
+ #include "base/basictypes.h"
+ #include "js/PropertyAndElement.h"  // JS_DefineProperty
++#include "js/JSON.h"
+ #include "jsapi.h"
+ #include "mozilla/AppShutdown.h"
+ #include "mozilla/AsyncEventDispatcher.h"
+@@ -69,6 +70,7 @@
+ #include "mozilla/dom/AudioTrack.h"
+ #include "mozilla/dom/AudioTrackList.h"
+ #include "mozilla/dom/BlobURLProtocolHandler.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/ContentMediaController.h"
+ #include "mozilla/dom/DocGroup.h"
+ #include "mozilla/dom/Document.h"
+@@ -86,6 +88,7 @@
+ #include "mozilla/dom/MediaSource.h"
+ #include "mozilla/dom/PlayPromise.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/TextTrack.h"
+ #include "mozilla/dom/UserActivation.h"
+ #include "mozilla/dom/VideoPlaybackQuality.h"
+@@ -5542,6 +5545,54 @@ CanPlayStatus HTMLMediaElement::GetCanPlay(
+ }
+ 
+ void HTMLMediaElement::CanPlayType(const nsAString& aType, nsAString& aResult) {
++  // BROWSER_FINGERPRINT: optional per-context codec matrix. Exact keys are
++  // intentional: malformed or missing entries cleanly fall back to Gecko.
++  Document* document = OwnerDoc();
++  BrowsingContext* context =
++      document ? document->GetBrowsingContext() : nullptr;
++  nsPIDOMWindowInner* window =
++      document ? document->GetInnerWindow() : nullptr;
++  if (context && window) {
++    const nsString fingerprint =
++        context->Top()->GetFingerprintProfile();
++    if (!fingerprint.IsEmpty()) {
++      AutoJSAPI jsapi;
++      if (jsapi.Init(window)) {
++        JSContext* cx = jsapi.cx();
++        JS::Rooted<JS::Value> root(cx);
++        if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                         &root) &&
++            root.isObject()) {
++          JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++          JS::Rooted<JS::Value> mediaCodecs(cx);
++          JS::Rooted<JS::Value> canPlayType(cx);
++          JS::Rooted<JS::Value> configured(cx);
++          NS_ConvertUTF16toUTF8 key(aType);
++          if (JS_GetProperty(cx, rootObject, "mediaCodecs", &mediaCodecs) &&
++              mediaCodecs.isObject()) {
++            JS::Rooted<JSObject*> mediaCodecsObject(
++                cx, &mediaCodecs.toObject());
++            if (JS_GetProperty(cx, mediaCodecsObject, "canPlayType",
++                               &canPlayType) &&
++                canPlayType.isObject()) {
++              JS::Rooted<JSObject*> canPlayTypeObject(
++                  cx, &canPlayType.toObject());
++              if (JS_GetProperty(cx, canPlayTypeObject, key.get(),
++                                 &configured) &&
++                  configured.isString()) {
++                nsAutoJSString value;
++                if (value.init(cx, configured.toString())) {
++                  aResult.Assign(value);
++                  return;
++                }
++              }
++            }
++          }
++        }
++        JS_ClearPendingException(cx);
++      }
++    }
++  }
+   DecoderDoctorDiagnostics diagnostics;
+   CanPlayStatus canPlay = GetCanPlay(aType, &diagnostics);
+   diagnostics.StoreFormatDiagnostics(OwnerDoc(), aType, canPlay != CANPLAY_NO,
+diff --git a/dom/media/mediasource/MediaSource.cpp b/dom/media/mediasource/MediaSource.cpp
+index a6eaa23..92daafc 100644
+--- a/dom/media/mediasource/MediaSource.cpp
++++ b/dom/media/mediasource/MediaSource.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "MediaSource.h"
+ 
++#include "js/Array.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ #include "AsyncEventRunner.h"
+ #include "DecoderDoctorDiagnostics.h"
+ #include "DecoderTraits.h"
+@@ -18,8 +21,10 @@
+ #include "mozilla/Logging.h"
+ #include "mozilla/StaticPrefs_media.h"
+ #include "mozilla/dom/BindingDeclarations.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/HTMLMediaElement.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/gfx/gfxVars.h"
+ #include "mozilla/glean/DomMediaMetrics.h"
+ #include "mozilla/mozalloc.h"
+@@ -429,6 +434,54 @@ bool MediaSource::IsTypeSupported(const GlobalObject& aOwner,
+   nsCOMPtr<nsPIDOMWindowInner> window =
+       do_QueryInterface(aOwner.GetAsSupports());
+   Document* doc = window ? window->GetExtantDoc() : nullptr;
++  BrowsingContext* context = doc ? doc->GetBrowsingContext() : nullptr;
++  if (context && window) {
++    const nsString fingerprint =
++        context->Top()->GetFingerprintProfile();
++    if (!fingerprint.IsEmpty()) {
++      AutoJSAPI jsapi;
++      if (jsapi.Init(window)) {
++        JSContext* cx = jsapi.cx();
++        JS::Rooted<JS::Value> root(cx);
++        if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                         &root) &&
++            root.isObject()) {
++          JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++          JS::Rooted<JS::Value> mediaCodecs(cx);
++          JS::Rooted<JS::Value> mediaSource(cx);
++          if (JS_GetProperty(cx, rootObject, "mediaCodecs", &mediaCodecs) &&
++              mediaCodecs.isObject()) {
++            JS::Rooted<JSObject*> mediaCodecsObject(
++                cx, &mediaCodecs.toObject());
++            if (JS_GetProperty(cx, mediaCodecsObject, "mediaSource",
++                               &mediaSource) &&
++                mediaSource.isObject()) {
++              JS::Rooted<JSObject*> array(cx, &mediaSource.toObject());
++              bool isArray = false;
++              uint32_t length = 0;
++              if (JS::IsArrayObject(cx, array, &isArray) && isArray &&
++                  JS::GetArrayLength(cx, array, &length)) {
++                for (uint32_t i = 0; i < length; ++i) {
++                  JS::Rooted<JS::Value> entry(cx);
++                  if (!JS_GetElement(cx, array, i, &entry) ||
++                      !entry.isString()) {
++                    continue;
++                  }
++                  nsAutoJSString configured;
++                  if (configured.init(cx, entry.toString()) &&
++                      configured.Equals(aType)) {
++                    return true;
++                  }
++                }
++                return false;
++              }
++            }
++          }
++        }
++        JS_ClearPendingException(cx);
++      }
++    }
++  }
+   IsTypeSupported(
+       aType, &diagnostics, rv,
+       doc ? Some(doc->ShouldResistFingerprinting(RFPTarget::MediaCapabilities))
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+index 8e6131e..8ee0ab6 100644
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -236,6 +236,9 @@ class WorkerPrivate final
+   NS_INLINE_DECL_REFCOUNTING(WorkerPrivate)
+ 
+   FONT_VISIBILITY_PROVIDER_IMPL
++  void CopyFingerprintProfile(nsAString& aProfile) const override {
++    aProfile.Assign(mLoadInfo.mFingerprintProfile);
++  }
+ 
+   static already_AddRefed<WorkerPrivate> Constructor(
+       JSContext* aCx, const nsAString& aScriptURL, bool aIsChromeWorker,
+@@ -816,6 +819,11 @@ class WorkerPrivate final
+ 
+   const nsCString& Domain() const { return mLoadInfo.mDomain; }
+ 
++  // //BROWSER_FINGERPRINT: worker 画像快照(创建时从创建者 BC/父 worker 取)
++  const nsString& GetFingerprintProfile() const {
++    return mLoadInfo.mFingerprintProfile;
++  }
++
+   bool IsFromWindow() const { return mLoadInfo.mFromWindow; }
+ 
+   nsLoadFlags GetLoadFlags() const { return mLoadInfo.mLoadFlags; }
+diff --git a/gfx/thebes/gfxTextRun.cpp b/gfx/thebes/gfxTextRun.cpp
+index fc1293b..527524f 100644
+--- a/gfx/thebes/gfxTextRun.cpp
++++ b/gfx/thebes/gfxTextRun.cpp
+@@ -1860,6 +1860,59 @@ static StyleGenericFontFamily GetDefaultGeneric(nsAtom* aLanguage) {
+       ->GetDefaultGeneric();
+ }
+ 
++// BROWSER_FINGERPRINT: resolve a per-context font alias before the platform
++// font lookup. This is in the actual font selection path, so Canvas text
++// metrics, DOM layout and Range geometry all observe the same selected font.
++static bool FpLookupFontAlias(FontVisibilityProvider* aProvider,
++                              const nsACString& aName,
++                              nsACString& aAlias) {
++  if (!aProvider) {
++    return false;
++  }
++  nsAutoString profile16;
++  aProvider->CopyFingerprintProfile(profile16);
++  if (profile16.IsEmpty()) {
++    return false;
++  }
++  NS_ConvertUTF16toUTF8 profile(profile16);
++  int32_t objectKey = profile.Find("\"fontAliases\"");
++  if (objectKey < 0) {
++    return false;
++  }
++  int32_t objectStart = profile.FindChar('{', objectKey);
++  int32_t objectEnd =
++      objectStart < 0 ? -1 : profile.FindChar('}', objectStart + 1);
++  if (objectStart < 0 || objectEnd < 0) {
++    return false;
++  }
++
++  nsAutoCString key("\"");
++  key.Append(aName);
++  key.Append('"');
++  nsDependentCSubstring aliases(
++      profile, objectStart + 1, objectEnd - objectStart - 1);
++  int32_t keyOffset = aliases.Find(key);
++  if (keyOffset < 0) {
++    return false;
++  }
++  int32_t keyPos = objectStart + 1 + keyOffset;
++  int32_t colon = profile.FindChar(':', keyPos + key.Length());
++  if (colon < 0 || colon >= objectEnd) {
++    return false;
++  }
++  int32_t valueStart = profile.FindChar('"', colon + 1);
++  if (valueStart < 0 || valueStart >= objectEnd) {
++    return false;
++  }
++  int32_t valueEnd = profile.FindChar('"', valueStart + 1);
++  if (valueEnd <= valueStart || valueEnd > objectEnd) {
++    return false;
++  }
++  aAlias.Assign(Substring(profile, valueStart + 1,
++                          valueEnd - valueStart - 1));
++  return !aAlias.IsEmpty();
++}
++
+ class DeferredClearResolvedFonts final : public nsIRunnable {
+  public:
+   NS_DECL_THREADSAFE_ISUPPORTS
+@@ -1923,6 +1976,23 @@ void gfxFontGroup::EnsureFontList() {
+     } else {
+       MOZ_ASSERT(name.IsGeneric());
+       const StyleGenericFontFamily generic = name.AsGeneric();
++      const char* genericName = nullptr;
++      if (generic == StyleGenericFontFamily::SystemUi) {
++        genericName = "system-ui";
++      } else if (generic == StyleGenericFontFamily::SansSerif) {
++        genericName = "sans-serif";
++      } else if (generic == StyleGenericFontFamily::Serif) {
++        genericName = "serif";
++      } else if (generic == StyleGenericFontFamily::Monospace) {
++        genericName = "monospace";
++      }
++      nsAutoCString genericAlias;
++      if (genericName &&
++          FpLookupFontAlias(mFontVisibilityProvider,
++                            nsDependentCString(genericName), genericAlias)) {
++        AddPlatformFont(genericAlias, false, fonts);
++        continue;
++      }
+       // system-ui is usually a single family, so it doesn't work great as
+       // fallback. Prefer the following generic or the language default instead.
+       if (mFallbackGeneric == StyleGenericFontFamily::None &&
+@@ -1976,9 +2046,12 @@ void gfxFontGroup::AddPlatformFont(const nsACString& aName, bool aQuotedName,
+     }
+   }
+ 
++  nsAutoCString platformName(aName);
++  FpLookupFontAlias(mFontVisibilityProvider, aName, platformName);
++
+   // Not known in the user font set ==> check system fonts
+   gfxPlatformFontList::PlatformFontList()->FindAndAddFamilies(
+-      mFontVisibilityProvider, StyleGenericFontFamily::None, aName,
++      mFontVisibilityProvider, StyleGenericFontFamily::None, platformName,
+       &aFamilyList,
+       aQuotedName ? gfxPlatformFontList::FindFamiliesFlags::eQuotedFamilyName
+                   : gfxPlatformFontList::FindFamiliesFlags(0),
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+index b2394c6..ca4e9a2 100644
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -112,6 +112,16 @@ using namespace mozilla::dom;
+ using namespace mozilla::gfx;
+ using namespace mozilla::layers;
+ 
++void nsPresContext::CopyFingerprintProfile(nsAString& aProfile) const {
++  aProfile.Truncate();
++  if (!mDocument) {
++    return;
++  }
++  if (BrowsingContext* context = mDocument->GetBrowsingContext()) {
++    aProfile.Assign(context->Top()->GetFingerprintProfile());
++  }
++}
++
+ static LazyLogModule gFingerprinterDetection("FingerprinterDetection");
+ 
+ /**
+@@ -741,6 +751,31 @@ void nsPresContext::UpdateForcedColors(bool aNotify) {
+       return StyleForcedColors::None;
+     }
+ 
++    // BROWSER_FINGERPRINT: cssMedia.forcedColors is per BrowsingContext.
++    // Read it before the process-wide accessibility theme.
++    if (auto* context = mDocument->GetBrowsingContext()) {
++      const nsString profile =
++          context->Top()->GetFingerprintProfile();
++      int32_t key = profile.Find(u"\"forcedColors\"");
++      if (key >= 0) {
++        int32_t colon = profile.FindChar(u':', key);
++        int32_t firstQuote =
++            colon < 0 ? -1 : profile.FindChar(u'"', colon + 1);
++        int32_t lastQuote =
++            firstQuote < 0 ? -1 : profile.FindChar(u'"', firstQuote + 1);
++        if (lastQuote > firstQuote) {
++          const nsDependentSubstring value(
++              profile, firstQuote + 1, lastQuote - firstQuote - 1);
++          if (value.EqualsLiteral("active")) {
++            return StyleForcedColors::Active;
++          }
++          if (value.EqualsLiteral("none")) {
++            return StyleForcedColors::None;
++          }
++        }
++      }
++    }
++
+     // Handle BrowsingContext override.
+     if (auto* bc = mDocument->GetBrowsingContext();
+         bc &&
+@@ -913,7 +948,7 @@ void nsPresContext::RecomputeBrowsingContextDependentData() {
+     auto systemZoom = LookAndFeel::SystemZoomSettings();
+     SetFullZoom(browsingContext->FullZoom() * systemZoom.mFullZoom);
+     SetTextZoom(browsingContext->TextZoom() * systemZoom.mTextZoom);
+-    SetOverrideDPPX(browsingContext->OverrideDPPX());
++    SetOverrideDPPX(browsingContext->Top()->OverrideDPPX());
+   }
+ 
+   auto* top = browsingContext->Top();
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+index 13aa714..264d6e0 100644
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -145,6 +145,7 @@ class nsPresContext : public nsISupports,
+   NS_DECL_CYCLE_COLLECTION_CLASS(nsPresContext)
+ 
+   FONT_VISIBILITY_PROVIDER_IMPL
++  void CopyFingerprintProfile(nsAString& aProfile) const override;
+ 
+   enum nsPresContextType : uint8_t {
+     eContext_Galley,        // unpaginated screen presentation
+diff --git a/layout/style/nsMediaFeatures.cpp b/layout/style/nsMediaFeatures.cpp
+index 1f9613b..e6ad16f 100644
+--- a/layout/style/nsMediaFeatures.cpp
++++ b/layout/style/nsMediaFeatures.cpp
+@@ -12,6 +12,7 @@
+ #include "mozilla/StaticPrefs_gfx.h"
+ #include "mozilla/StyleSheet.h"
+ #include "mozilla/StyleSheetInlines.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/BrowsingContextBinding.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/DocumentInlines.h"
+@@ -33,6 +34,36 @@ using namespace mozilla;
+ using mozilla::dom::DisplayMode;
+ using mozilla::dom::Document;
+ 
++static bool FingerprintCssMedia(const Document* aDocument, const char* aKey,
++                                nsAString& aValue) {
++  if (!aDocument) return false;
++  dom::BrowsingContext* context = aDocument->GetBrowsingContext();
++  if (!context) return false;
++  const nsString profile = context->Top()->GetFingerprintProfile();
++  if (profile.IsEmpty()) return false;
++  nsAutoString pattern;
++  pattern.Append(char16_t('"'));
++  pattern.AppendASCII(aKey);
++  pattern.Append(char16_t('"'));
++  pattern.Append(char16_t(':'));
++  int32_t position = profile.Find(pattern);
++  if (position < 0) return false;
++  position += pattern.Length();
++  while (position < static_cast<int32_t>(profile.Length()) &&
++         (profile[position] == char16_t(' ') ||
++          profile[position] == char16_t('\t'))) {
++    ++position;
++  }
++  if (position >= static_cast<int32_t>(profile.Length()) ||
++      profile[position] != char16_t('"')) {
++    return false;
++  }
++  int32_t end = profile.FindChar(char16_t('"'), position + 1);
++  if (end < 0) return false;
++  aValue.Assign(Substring(profile, position + 1, end - position - 1));
++  return true;
++}
++
+ // A helper for four features below
+ static nsSize GetSize(const Document& aDocument) {
+   nsPresContext* pc = aDocument.GetPresContext();
+@@ -150,6 +181,13 @@ int32_t Gecko_MediaFeatures_GetMonochromeBitsPerPixel(
+ }
+ 
+ StyleColorGamut Gecko_MediaFeatures_ColorGamut(const Document* aDocument) {
++  nsAutoString fingerprintValue;
++  if (FingerprintCssMedia(aDocument, "colorGamut", fingerprintValue)) {
++    if (fingerprintValue.EqualsLiteral("rec2020"))
++      return StyleColorGamut::Rec2020;
++    if (fingerprintValue.EqualsLiteral("p3")) return StyleColorGamut::P3;
++    return StyleColorGamut::Srgb;
++  }
+   auto* dx = GetDeviceContextFor(aDocument);
+   if (!dx || aDocument->ShouldResistFingerprinting(RFPTarget::CSSColorInfo)) {
+     return StyleColorGamut::Srgb;
+@@ -274,6 +312,11 @@ bool Gecko_MediaFeatures_MatchesPlatform(StylePlatform aPlatform) {
+ }
+ 
+ bool Gecko_MediaFeatures_PrefersReducedMotion(const Document* aDocument) {
++  nsAutoString fingerprintValue;
++  if (FingerprintCssMedia(aDocument, "prefersReducedMotion",
++                          fingerprintValue)) {
++    return fingerprintValue.EqualsLiteral("reduce");
++  }
+   if (aDocument->ShouldResistFingerprinting(
+           RFPTarget::CSSPrefersReducedMotion)) {
+     return false;
+@@ -322,6 +365,16 @@ bool Gecko_MediaFeatures_MacRTL(const Document* aDocument) {
+ // as a signal.
+ StylePrefersContrast Gecko_MediaFeatures_PrefersContrast(
+     const Document* aDocument) {
++  nsAutoString fingerprintValue;
++  if (FingerprintCssMedia(aDocument, "prefersContrast", fingerprintValue)) {
++    if (fingerprintValue.EqualsLiteral("more"))
++      return StylePrefersContrast::More;
++    if (fingerprintValue.EqualsLiteral("less"))
++      return StylePrefersContrast::Less;
++    if (fingerprintValue.EqualsLiteral("custom"))
++      return StylePrefersContrast::Custom;
++    return StylePrefersContrast::NoPreference;
++  }
+   if (aDocument->ShouldResistFingerprinting(RFPTarget::CSSPrefersContrast)) {
+     return StylePrefersContrast::NoPreference;
+   }
+@@ -361,6 +414,12 @@ StyleScripting Gecko_MediaFeatures_Scripting(const Document* aDocument) {
+ }
+ 
+ StyleDynamicRange Gecko_MediaFeatures_DynamicRange(const Document* aDocument) {
++  nsAutoString fingerprintValue;
++  if (FingerprintCssMedia(aDocument, "dynamicRange", fingerprintValue)) {
++    return fingerprintValue.EqualsLiteral("high")
++               ? StyleDynamicRange::High
++               : StyleDynamicRange::Standard;
++  }
+   // Bug 1759772: Once HDR color is available, update each platform
+   // LookAndFeel implementation to return StyleDynamicRange::High when
+   // appropriate.
+@@ -369,6 +428,12 @@ StyleDynamicRange Gecko_MediaFeatures_DynamicRange(const Document* aDocument) {
+ 
+ StyleDynamicRange Gecko_MediaFeatures_VideoDynamicRange(
+     const Document* aDocument) {
++  nsAutoString fingerprintValue;
++  if (FingerprintCssMedia(aDocument, "dynamicRange", fingerprintValue)) {
++    return fingerprintValue.EqualsLiteral("high")
++               ? StyleDynamicRange::High
++               : StyleDynamicRange::Standard;
++  }
+   if (aDocument->ShouldResistFingerprinting(RFPTarget::CSSVideoDynamicRange)) {
+     return StyleDynamicRange::Standard;
+   }
+@@ -397,6 +462,42 @@ StyleDynamicRange Gecko_MediaFeatures_VideoDynamicRange(
+   return StyleDynamicRange::Standard;
+ }
+ 
++// BROWSER_FINGERPRINT: minimal int extractor over the profile JSON.
++static bool FpMfExtractInt(const nsAString& aJson, const char* aKey,
++                           int32_t& aOut) {
++  nsAutoString pat;
++  pat.Append(char16_t('"'));
++  pat.AppendASCII(aKey);
++  pat.Append(char16_t('"'));
++  const char16_t* d = aJson.BeginReading();
++  const char16_t* p = pat.BeginReading();
++  uint32_t n = aJson.Length(), pl = pat.Length();
++  for (uint32_t i = 0; i + pl <= n; ++i) {
++    bool m = true;
++    for (uint32_t j = 0; j < pl; ++j) {
++      if (d[i + j] != p[j]) { m = false; break; }
++    }
++    if (!m) continue;
++    uint32_t k = i + pl;
++    while (k < n && (d[k] == char16_t(' ') || d[k] == char16_t('\t'))) ++k;
++    if (k >= n || d[k] != char16_t(':')) continue;
++    ++k;
++    while (k < n && (d[k] == char16_t(' ') || d[k] == char16_t('\t'))) ++k;
++    uint32_t s = k, e = k;
++    if (e < n && (d[e] == char16_t('-') || d[e] == char16_t('+'))) ++e;
++    uint32_t ds = e;
++    while (e < n && d[e] >= char16_t('0') && d[e] <= char16_t('9')) ++e;
++    if (e == ds) continue;
++    nsAutoString num(Substring(aJson, s, e - s));
++    nsresult rv;
++    int32_t v = num.ToInteger(&rv);
++    if (NS_FAILED(rv)) continue;
++    aOut = v;
++    return true;
++  }
++  return false;
++}
++
+ static PointerCapabilities GetPointerCapabilities(const Document* aDocument,
+                                                   LookAndFeel::IntID aID) {
+   MOZ_ASSERT(aID == LookAndFeel::IntID::PrimaryPointerCapabilities ||
+@@ -411,6 +512,23 @@ static PointerCapabilities GetPointerCapabilities(const Document* aDocument,
+     }
+   }
+ 
++  // BROWSER_FINGERPRINT: profile maxTouchPoints overrides host LookAndFeel so a
++  // mouseless cloud VM does not leak coarse/none under a desktop UA. Serves both
++  // primary and any-* (this fn backs both); the HOVER bit also drives
++  // hover:/any-hover:. desktop(mtp==0)=Fine|Hover, mobile(mtp>0)=Coarse. Missing
++  // key => native path below.
++  if (dom::BrowsingContext* bc = aDocument->GetBrowsingContext()) {
++    if (dom::BrowsingContext* top = bc->Top()) {
++      nsString fpj = top->GetFingerprintProfile();
++      int32_t mtp;
++      if (!fpj.IsEmpty() && FpMfExtractInt(fpj, "maxTouchPoints", mtp)) {
++        return mtp > 0
++                   ? PointerCapabilities::Coarse
++                   : (PointerCapabilities::Fine | PointerCapabilities::Hover);
++      }
++    }
++  }
++
+   // The default value for Desktop is mouse-type pointer, and for Android
+   // a coarse pointer.
+   const PointerCapabilities kDefaultCapabilities =
+diff --git a/toolkit/components/resistfingerprinting/FontVisibilityProvider.cpp b/toolkit/components/resistfingerprinting/FontVisibilityProvider.cpp
+index dffc599..538fbee 100644
+--- a/toolkit/components/resistfingerprinting/FontVisibilityProvider.cpp
++++ b/toolkit/components/resistfingerprinting/FontVisibilityProvider.cpp
+@@ -11,6 +11,7 @@
+ #include "SharedFontList.h"
+ #include "nsPresContext.h"
+ #include "nsRFPService.h"
++#include "nsString.h"
+ 
+ #include "mozilla/StaticPrefs_layout.h"
+ #include "mozilla/ContentBlockingAllowList.h"
+@@ -21,6 +22,11 @@
+ 
+ using namespace mozilla;
+ 
++void FontVisibilityProvider::CopyFingerprintProfile(
++    nsAString& aProfile) const {
++  aProfile.Truncate();
++}
++
+ void FontVisibilityProvider::ReportBlockedFontFamily(
+     const gfxFontFamily& aFamily) const {
+   nsCString msg;
+diff --git a/toolkit/components/resistfingerprinting/FontVisibilityProvider.h b/toolkit/components/resistfingerprinting/FontVisibilityProvider.h
+index 2f71aae..8690805 100644
+--- a/toolkit/components/resistfingerprinting/FontVisibilityProvider.h
++++ b/toolkit/components/resistfingerprinting/FontVisibilityProvider.h
+@@ -9,6 +9,7 @@
+ 
+ #include "mozilla/Maybe.h"
+ #include "nsICookieJarSettings.h"
++#include "nsStringFwd.h"
+ 
+ class nsPresContext;
+ class gfxFontFamily;
+@@ -42,6 +43,7 @@ class FontVisibilityProvider {
+   virtual nsICookieJarSettings* GetCookieJarSettings() const = 0;
+   virtual mozilla::Maybe<FontVisibility> MaybeInheritFontVisibility() const = 0;
+   virtual void UserFontSetUpdated(gfxUserFontEntry* aUpdatedFont = nullptr) = 0;
++  virtual void CopyFingerprintProfile(nsAString& aProfile) const;
+ 
+   void ReportBlockedFontFamily(const gfxFontFamily& aFamily) const;
+   void ReportBlockedFontFamily(const mozilla::fontlist::Family& aFamily) const;

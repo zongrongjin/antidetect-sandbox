@@ -1,0 +1,198 @@
+diff --git a/remote/webdriver-bidi/modules/root/_configuration.sys.mjs b/remote/webdriver-bidi/modules/root/_configuration.sys.mjs
+index 765a55e439..7f1d696a91 100644
+--- a/remote/webdriver-bidi/modules/root/_configuration.sys.mjs
++++ b/remote/webdriver-bidi/modules/root/_configuration.sys.mjs
+@@ -30,6 +30,8 @@ ChromeUtils.defineESModuleGetters(lazy, {
+     "chrome://remote/content/webdriver-bidi/modules/root/emulation.sys.mjs",
+   setTimezoneOverrideForBrowsingContext:
+     "chrome://remote/content/webdriver-bidi/modules/root/emulation.sys.mjs",
++  setFingerprintProfileForBrowsingContext:
++    "chrome://remote/content/webdriver-bidi/modules/root/emulation.sys.mjs", //BROWSER_FINGERPRINT
+   setUserAgentOverrideForBrowsingContext:
+     "chrome://remote/content/webdriver-bidi/modules/root/emulation.sys.mjs",
+   TabManager: "chrome://remote/content/shared/TabManager.sys.mjs",
+@@ -58,6 +60,7 @@ const NULL = Symbol("NULL");
+ // except from `viewport-override` which is handled separately.
+ const CONFIGURATIONS_TO_APPLY = [
+   "download-behavior-override",
++  "fingerprint-override", //BROWSER_FINGERPRINT
+   "locale-override",
+   "network-conditions",
+   "screen-orientation-override",
+@@ -99,7 +102,8 @@ class _ConfigurationModule extends RootBiDiModule {
+       // see https://www.w3.org/TR/webdriver-bidi/#command-emulation-setUserAgentOverride.
+       if (
+         configuration === "user-agent-override" ||
+-        configuration === "download-behavior-override"
++        configuration === "download-behavior-override" ||
++        configuration === "fingerprint-override" //BROWSER_FINGERPRINT
+       ) {
+         this.#configurationMap[configuration][lazy.ContextDescriptorType.All] =
+           null;
+@@ -317,6 +321,18 @@ class _ConfigurationModule extends RootBiDiModule {
+       });
+     }
+ 
++    //BROWSER_FINGERPRINT: replay fingerprint profile onto future top BCs
++    const fingerprintOverride = this.#findCorrectConfigurationValue(
++      configurationMap["fingerprint-override"],
++      "string"
++    );
++    if (fingerprintOverride !== null) {
++      lazy.setFingerprintProfileForBrowsingContext({
++        context: browsingContext,
++        value: fingerprintOverride,
++      });
++    }
++
+     const contextId =
+       lazy.NavigableManager.getIdForBrowsingContext(browsingContext);
+     lazy.logger.trace(
+@@ -460,6 +476,8 @@ class _ConfigurationModule extends RootBiDiModule {
+         return this.#applyTimezoneOverride(commandArgs);
+       case "user-agent-override":
+         return lazy.setUserAgentOverrideForBrowsingContext(commandArgs);
++      case "fingerprint-override": //BROWSER_FINGERPRINT
++        return lazy.setFingerprintProfileForBrowsingContext(commandArgs);
+       default:
+         return undefined;
+     }
+diff --git a/remote/webdriver-bidi/modules/root/emulation.sys.mjs b/remote/webdriver-bidi/modules/root/emulation.sys.mjs
+index 84ac9d09e5..f6865a5854 100644
+--- a/remote/webdriver-bidi/modules/root/emulation.sys.mjs
++++ b/remote/webdriver-bidi/modules/root/emulation.sys.mjs
+@@ -838,4 +838,59 @@ export const setUserAgentOverrideForBrowsingContext = options => {
+   }
+ };
+ 
++//BROWSER_FINGERPRINT
++/**
++ * Set the fingerprint profile override to the top-level browsing context.
++ * Writes context.customFingerprint (synced BC field), and, if the profile JSON
++ * carries timezone/locale keys, also drives the existing tz/locale BC overrides
++ * so timezone-/language-dependent APIs stay consistent with the profile.
++ *
++ * @param {object} options
++ * @param {BrowsingContext} options.context
++ * @param {string} options.value  Fingerprint profile as a JSON string ("" resets).
++ */
++export const setFingerprintProfileForBrowsingContext = options => {
++  const { context, value } = options;
++  const contextId = lazy.NavigableManager.getIdForBrowsingContext(context);
++
++  try {
++    context.customFingerprint = value;
++
++    let tz = "";
++    let loc = "";
++    if (value) {
++      try {
++        const obj = JSON.parse(value);
++        if (obj && typeof obj.timezone === "string") {
++          tz = obj.timezone;
++        }
++        if (obj && typeof obj.locale === "string") {
++          loc = obj.locale;
++        }
++      } catch (e) {
++        lazy.logger.warn(
++          `Failed to parse fingerprint profile for context ${contextId}: ${e.message}`
++        );
++      }
++    }
++    // Keep existing tz/locale behaviour: set (or reset to "") the BC overrides.
++    try {
++      context.timezoneOverride = tz;
++    } catch (e) {
++      lazy.logger.warn(`[${contextId}] fingerprint tz override failed: ${e.message}`);
++    }
++    try {
++      context.languageOverride = loc;
++    } catch (e) {
++      lazy.logger.warn(`[${contextId}] fingerprint locale override failed: ${e.message}`);
++    }
++
++    lazy.logger.trace(`[${contextId}] Updated fingerprint profile override`);
++  } catch (e) {
++    lazy.logger.warn(
++      `Failed to override fingerprint for context with id: ${contextId} (${e.message})`
++    );
++  }
++};
++
+ export const emulation = EmulationModule;
+diff --git a/remote/webdriver-bidi/modules/root/moz/fingerprint.sys.mjs b/remote/webdriver-bidi/modules/root/moz/fingerprint.sys.mjs
+new file mode 100644
+index 0000000000..4d0f532ed1
+--- /dev/null
++++ b/remote/webdriver-bidi/modules/root/moz/fingerprint.sys.mjs
+@@ -0,0 +1,69 @@
++/* BROWSER_FINGERPRINT */
++import { RootBiDiModule } from "chrome://remote/content/webdriver-bidi/modules/RootBiDiModule.sys.mjs";
++
++const lazy = {};
++ChromeUtils.defineESModuleGetters(lazy, {
++  assert: "chrome://remote/content/shared/webdriver/Assert.sys.mjs",
++  pprint: "chrome://remote/content/shared/Format.sys.mjs",
++  RootMessageHandler:
++    "chrome://remote/content/shared/messagehandler/RootMessageHandler.sys.mjs",
++});
++
++/**
++ * moz:fingerprint module (root). Routes the per-context fingerprint profile
++ * through the standard _configuration/SessionData machinery so that:
++ *  - it can be scoped per browsing context (contexts) or per user context
++ *    (userContexts), or applied globally when neither is given, and
++ *  - future top-level browsing contexts created within the scope inherit it
++ *    (replayed from SessionData via _configuration.#onContextAttached).
++ */
++class FingerprintModule extends RootBiDiModule {
++  constructor(messageHandler) {
++    super(messageHandler);
++  }
++
++  destroy() {}
++
++  /**
++   * Set the fingerprint profile override.
++   *
++   * @param {object=} params
++   * @param {string=} params.fingerprint
++   *     Fingerprint profile as a JSON string. Empty string resets the override.
++   * @param {Array<string>=} params.contexts
++   *     Optional list of top-level browsing context ids to scope to.
++   * @param {Array<string>=} params.userContexts
++   *     Optional list of user context ids to scope to.
++   */
++  async setContextOverrides(params = {}) {
++    const {
++      fingerprint = "",
++      contexts: contextIds,
++      userContexts: userContextIds,
++    } = params;
++
++    lazy.assert.string(
++      fingerprint,
++      lazy.pprint`Expected "fingerprint" to be a string, got ${fingerprint}`
++    );
++
++    await this.messageHandler.handleCommand({
++      moduleName: "_configuration",
++      commandName: "_applyConfigurationParameters",
++      destination: { type: lazy.RootMessageHandler.type },
++      params: {
++        async: false,
++        category: "fingerprint-override",
++        contextIds,
++        resetValue: "",
++        supportsGlobalConfiguration: true,
++        userContextIds,
++        value: fingerprint,
++      },
++    });
++
++    return {};
++  }
++}
++
++export const fingerprint = FingerprintModule;

@@ -1,0 +1,123 @@
+diff --git a/p2p/base/port_allocator.h b/p2p/base/port_allocator.h
+index b15262d..d3cb187 100644
+--- a/p2p/base/port_allocator.h
++++ b/p2p/base/port_allocator.h
+@@ -561,6 +561,17 @@ class RTC_EXPORT PortAllocator {
+     return true;
+   }
+ 
++  // //BROWSER_FINGERPRINT: srflx candidate 对外上报的公网 IP（空串=不覆盖）。
++  // 只影响 candidate 中可见的地址，ICE 内部仍使用真实的反射地址。
++  void SetFingerprintSrflxIp(absl::string_view ip) {
++    CheckRunOnValidThreadIfInitialized();
++    fingerprint_srflx_ip_ = std::string(ip);
++  }
++  const std::string& fingerprint_srflx_ip() const {
++    CheckRunOnValidThreadIfInitialized();
++    return fingerprint_srflx_ip_;
++  }
++
+   // Can be used to change the default numer of IPv6 network interfaces used
+   // (5). Can set to INT_MAX to effectively disable the limit.
+   //
+@@ -699,6 +710,8 @@ class RTC_EXPORT PortAllocator {
+   bool allow_tcp_listen_;
+   uint32_t candidate_filter_;
+   std::string origin_;
++  // //BROWSER_FINGERPRINT
++  std::string fingerprint_srflx_ip_;
+   SequenceChecker thread_checker_;
+   VpnPreference vpn_preference_ = VpnPreference::kDefault;
+ 
+diff --git a/p2p/base/stun_port.cc b/p2p/base/stun_port.cc
+index e35c9ca..c4fcead 100644
+--- a/p2p/base/stun_port.cc
++++ b/p2p/base/stun_port.cc
+@@ -562,9 +562,28 @@ void UDPPort::OnStunBindingRequestSucceeded(
+   // address and mDNS obfuscation is not enabled, or if the same address has
+   // been added by another STUN server, then discarding the stun address.
+   // For STUN, related address is the local socket address.
+-  if ((!SharedSocket() || stun_reflected_addr != socket_->GetLocalAddress() ||
++  // //BROWSER_FINGERPRINT: 先算出最终要上报的地址。去重必须基于它 ——
++  // HasStunCandidateWithAddress() 比对的是已添加 candidate 的地址，覆盖开启后
++  // 那些地址已经是 fakeIP；若仍拿真实反射地址去判断就永远匹配不上，多个 STUN
++  // 服务器会各产出一条完全相同的 candidate（真实 Chrome 会去重，不会这样）。
++  SocketAddress fp_reported_addr = stun_reflected_addr;
++  bool fp_suppress = false;
++  if (!fingerprint_srflx_ip_.empty()) {
++    IPAddress fp_ip;
++    if (IPFromString(fingerprint_srflx_ip_, &fp_ip) &&
++        fp_ip.family() == stun_reflected_addr.family()) {
++      fp_reported_addr.SetIP(fp_ip);
++    } else {
++      // 地址族不匹配(例如只配了 IPv4 而这条是 IPv6)或解析失败时丢弃该 candidate
++      // —— 宁可不上报，也不能让未覆盖的那一族泄漏出去。
++      fp_suppress = true;
++    }
++  }
++
++  if (!fp_suppress &&
++      (!SharedSocket() || stun_reflected_addr != socket_->GetLocalAddress() ||
+        Network()->GetMdnsResponder() != nullptr) &&
+-      !HasStunCandidateWithAddress(stun_reflected_addr)) {
++      !HasStunCandidateWithAddress(fp_reported_addr)) {
+     SocketAddress related_address = socket_->GetLocalAddress();
+     // If we can't stamp the related address correctly, empty it to avoid leak.
+     if (!MaybeSetDefaultLocalAddress(&related_address)) {
+@@ -574,7 +593,7 @@ void UDPPort::OnStunBindingRequestSucceeded(
+     StringBuilder url;
+     url << "stun:" << stun_server_addr.hostname() << ":"
+         << stun_server_addr.port();
+-    AddAddress(stun_reflected_addr, socket_->GetLocalAddress(), related_address,
++    AddAddress(fp_reported_addr, socket_->GetLocalAddress(), related_address,
+                UDP_PROTOCOL_NAME, "", "", IceCandidateType::kSrflx,
+                ICE_TYPE_PREFERENCE_SRFLX, 0, url.str(), false);
+   }
+diff --git a/p2p/base/stun_port.h b/p2p/base/stun_port.h
+index 3baaf13..fe8672d 100644
+--- a/p2p/base/stun_port.h
++++ b/p2p/base/stun_port.h
+@@ -13,6 +13,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <string>
+ #include <functional>
+ #include <map>
+ #include <memory>
+@@ -90,6 +91,12 @@ class RTC_EXPORT UDPPort : public Port {
+     server_addresses_ = addresses;
+   }
+ 
++  // //BROWSER_FINGERPRINT: 上报 srflx candidate 时用该 IP 覆盖真实反射地址。
++  // 空串=不覆盖。地址族不匹配时丢弃该 candidate，而不是泄漏真实地址。
++  void SetFingerprintSrflxIp(const std::string& ip) {
++    fingerprint_srflx_ip_ = ip;
++  }
++
+   void PrepareAddress() override;
+ 
+   Connection* CreateConnection(const Candidate& address,
+@@ -225,6 +232,9 @@ class RTC_EXPORT UDPPort : public Port {
+                                                 : TimeDelta::PlusInfinity();
+   }
+ 
++  // //BROWSER_FINGERPRINT
++  std::string fingerprint_srflx_ip_;
++
+   ServerAddresses server_addresses_;
+   ServerAddresses bind_request_succeeded_servers_;
+   ServerAddresses bind_request_failed_servers_;
+diff --git a/p2p/client/basic_port_allocator.cc b/p2p/client/basic_port_allocator.cc
+index 3b36570..9eef0d2 100644
+--- a/p2p/client/basic_port_allocator.cc
++++ b/p2p/client/basic_port_allocator.cc
+@@ -1480,6 +1480,8 @@ void AllocationSequence::CreateUDPPorts() {
+   }
+ 
+   if (port) {
++    // //BROWSER_FINGERPRINT: 把 srflx 公网地址覆盖值传给 UDPPort
++    port->SetFingerprintSrflxIp(session_->allocator()->fingerprint_srflx_ip());
+     // If shared socket is enabled, STUN candidate will be allocated by the
+     // UDPPort.
+     if (IsFlagSet(PORTALLOCATOR_ENABLE_SHARED_SOCKET)) {

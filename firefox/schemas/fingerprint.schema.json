@@ -1,0 +1,765 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zongrongjin/antidetect-sandbox/firefox/schemas/fingerprint.schema.json",
+  "title": "Firefox zzbrowser per-userContext fingerprint profile",
+  "description": "The object serialized into the moz:fingerprint.setContextOverrides fingerprint string. Every property is optional; an omitted property preserves native behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "userAgent": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "platform": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "hardwareConcurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "x-zzbrowser-layer": "kernel"
+    },
+    "acceptLanguages": {
+      "type": "string",
+      "description": "HTTP Accept-Language syntax, for example en-US,en;q=0.9.",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "locale": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "timezone": {
+      "type": "string",
+      "description": "IANA timezone identifier.",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "screenWidth": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "screenHeight": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "availWidth": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "availHeight": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "availLeft": {
+      "type": "integer",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "availTop": {
+      "type": "integer",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "colorDepth": {
+      "type": "integer",
+      "minimum": 1,
+      "x-zzbrowser-layer": "kernel"
+    },
+    "dpr": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "x-zzbrowser-layer": "kernel+bc-bidi-viewport"
+    },
+    "maxTouchPoints": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webRTCPublicIP": {
+      "type": "string",
+      "description": "Replacement for srflx public addresses only.",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webRTC": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ],
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webglVendor": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webglRenderer": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webglExtensions": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webgl2Extensions": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webglParameters": {
+      "$ref": "#/$defs/webglParameterMap",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webgl2Parameters": {
+      "$ref": "#/$defs/webglParameterMap",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webglShaderPrecision": {
+      "$ref": "#/$defs/shaderPrecisionMap",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webgl2ShaderPrecision": {
+      "$ref": "#/$defs/shaderPrecisionMap",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "webGPU": {
+      "$ref": "#/$defs/webGPU",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "fontFamilies": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "fontAliases": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "x-zzbrowser-layer": "kernel"
+    },
+    "speechVoices": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/speechVoice"
+      },
+      "x-zzbrowser-layer": "kernel"
+    },
+    "mediaCodecs": {
+      "$ref": "#/$defs/mediaCodecs",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "mediaDevices": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mediaDevice"
+      },
+      "x-zzbrowser-layer": "kernel-enumeration-view"
+    },
+    "outerWidth": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "outerHeight": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "cssMedia": {
+      "$ref": "#/$defs/cssMedia",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "readbackSeed": {
+      "type": "integer",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "canvasDataReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "canvasUrlReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "canvasBlobReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "bc-contract-unsupported",
+      "description": "Serialized by the shared BC contract but not consumed by the current Firefox patch."
+    },
+    "glReadReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "audioReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "analyserFloatReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "analyserByteReplay": {
+      "$ref": "#/$defs/stringArray",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "referrer": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "viewportWidth": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "description": "Serialized by BC but applied through browsingContext.setViewport, not by moz:fingerprint.setContextOverrides alone.",
+      "x-zzbrowser-layer": "bc-only"
+    },
+    "viewportHeight": {
+      "$ref": "#/$defs/nonNegativeInteger",
+      "description": "Serialized by BC but applied through browsingContext.setViewport, not by moz:fingerprint.setContextOverrides alone.",
+      "x-zzbrowser-layer": "bc-only"
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/plugin"
+      },
+      "description": "Empty array forces navigator.plugins.length===0. Non-empty lists keep the native 5 PDF plugins. Missing key + Android/iOS UA also empties the list.",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "mimeTypes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mimeType"
+      },
+      "description": "Follows plugins: empty plugins surface also empties mimeTypes.",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "pdfViewerEnabled": {
+      "type": "boolean",
+      "description": "Explicit override. Android/iOS UA defaults to true so an empty plugin list stays paired with pdfViewerEnabled.",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "keyboard": {
+      "type": "boolean",
+      "description": "Chromium compatibility field. Real Firefox has no Keyboard API; the kernel ignores this key.",
+      "x-zzbrowser-layer": "ignored-firefox-native-absent"
+    },
+    "connection": {
+      "description": "false hides navigator.connection. An object or Android UA exposes the Firefox Network Information API (type only). iOS UA hides it. Desktop profiles omit the key and keep the native hidden pref.",
+      "x-zzbrowser-layer": "kernel",
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "cellular",
+                "bluetooth",
+                "ethernet",
+                "wifi",
+                "other",
+                "none",
+                "unknown"
+              ]
+            },
+            "effectiveType": {
+              "type": "string",
+              "enum": [
+                "slow-2g",
+                "2g",
+                "3g",
+                "4g"
+              ],
+              "description": "Chromium-shaped key. Firefox has no effectiveType attribute; 2g/3g/4g map to connection.type=cellular."
+            },
+            "downlink": {
+              "type": "number"
+            },
+            "rtt": {
+              "type": "number"
+            },
+            "saveData": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "productCapabilities": {
+      "$ref": "#/$defs/productCapabilities",
+      "description": "BC consistency metadata; not consumed by Firefox renderer read-points.",
+      "x-zzbrowser-layer": "bc-metadata"
+    },
+    "oscpu": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    },
+    "appVersion": {
+      "type": "string",
+      "x-zzbrowser-layer": "kernel"
+    }
+  },
+  "$defs": {
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "brand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "b",
+        "v"
+      ],
+      "properties": {
+        "b": {
+          "type": "string"
+        },
+        "v": {
+          "type": "string"
+        }
+      }
+    },
+    "webglParameterMap": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[0-9]+$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/webglParameter"
+      }
+    },
+    "webglParameter": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/webglBool"
+        },
+        {
+          "$ref": "#/$defs/webglInt"
+        },
+        {
+          "$ref": "#/$defs/webglUint"
+        },
+        {
+          "$ref": "#/$defs/webglFloat"
+        },
+        {
+          "$ref": "#/$defs/webglString"
+        },
+        {
+          "$ref": "#/$defs/webglInt32"
+        },
+        {
+          "$ref": "#/$defs/webglFloat32"
+        }
+      ]
+    },
+    "webglBool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "bool"
+        },
+        "value": {
+          "type": "boolean"
+        }
+      }
+    },
+    "webglInt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "int"
+        },
+        "value": {
+          "type": "integer"
+        }
+      }
+    },
+    "webglUint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "uint"
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "webglFloat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "float"
+        },
+        "value": {
+          "type": "number"
+        }
+      }
+    },
+    "webglString": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "webglInt32": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "int32"
+        },
+        "value": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "webglFloat32": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "const": "float32"
+        },
+        "value": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "shaderPrecisionMap": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[0-9]+:[0-9]+$"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "items": false,
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "webGPU": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "$ref": "#/$defs/webGPUAdapter"
+        },
+        "features": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "preferredCanvasFormat": {
+          "type": "string",
+          "enum": [
+            "bgra8unorm",
+            "rgba8unorm"
+          ]
+        }
+      }
+    },
+    "webGPUAdapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "vendor": {
+          "type": "string"
+        },
+        "architecture": {
+          "type": "string"
+        },
+        "device": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "isFallbackAdapter": {
+          "type": "boolean"
+        },
+        "subgroupMinSize": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "subgroupMaxSize": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "speechVoice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "lang",
+        "voiceURI",
+        "localService",
+        "default"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "lang": {
+          "type": "string"
+        },
+        "voiceURI": {
+          "type": "string"
+        },
+        "localService": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mediaCodecs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "canPlayType": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "",
+              "maybe",
+              "probably"
+            ]
+          }
+        },
+        "mediaSource": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "decodingInfo": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/decodingInfoResult"
+          }
+        }
+      }
+    },
+    "decodingInfoResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported",
+        "smooth",
+        "powerEfficient"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "smooth": {
+          "type": "boolean"
+        },
+        "powerEfficient": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mediaDevice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "deviceId",
+        "groupId",
+        "label"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "audioinput",
+            "audiooutput",
+            "videoinput"
+          ]
+        },
+        "deviceId": {
+          "type": "string"
+        },
+        "groupId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      }
+    },
+    "cssMedia": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "colorGamut": {
+          "type": "string",
+          "enum": [
+            "srgb",
+            "p3",
+            "rec2020"
+          ]
+        },
+        "dynamicRange": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "high"
+          ]
+        },
+        "forcedColors": {
+          "type": "string",
+          "enum": [
+            "none",
+            "active"
+          ]
+        },
+        "prefersContrast": {
+          "type": "string",
+          "enum": [
+            "no-preference",
+            "more",
+            "less",
+            "custom"
+          ]
+        },
+        "prefersReducedMotion": {
+          "type": "string",
+          "enum": [
+            "no-preference",
+            "reduce"
+          ]
+        }
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "filename",
+        "description",
+        "mimeTypes"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "filename": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "mimeTypes": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "mimeType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "suffixes",
+        "description"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "suffixes": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "productCapabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ]
+      }
+    }
+  }
+}
+

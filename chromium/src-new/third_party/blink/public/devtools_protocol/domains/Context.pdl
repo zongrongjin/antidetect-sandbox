@@ -1,0 +1,65 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# //BROWSER_CONTEXT: per-BrowserContext overrides (fingerprint + proxy + cache).
+# One command initializes the isolated context.
+experimental domain Context
+  type ProxyConfig extends object
+    properties
+      # "http://host:port" / "socks5://host:port" / "host:port". Empty clears.
+      optional string endpoint
+      optional string username
+      optional string password
+
+  type CacheConfig extends object
+    properties
+      # Absolute cache directory. Index lives at <dir>/_map.json; CDP map overlays it.
+      optional string dir
+      # JSON object: url -> {file, status, headers, created_at}. file is relative to dir.
+      optional string map
+      # JSON object: {captures,callbacks,blocks,allowMiss,observe,include,exclude,
+      # ttl,maxEntry,cacheableStatus}. include/exclude/ttl match Cache() args.
+      # MISS GET 2xx writes decoded body under dir and updates _map.json.
+      optional string rules
+
+  # Cookie to plant into this BrowserContext's store (Network.setCookie fields).
+  type CookieParam extends object
+    properties
+      string name
+      string value
+      optional string url
+      optional string domain
+      optional string path
+      optional boolean secure
+      optional boolean httpOnly
+      # "Strict" | "Lax" | "None"
+      optional string sameSite
+      # Unix seconds. Omit for a session cookie.
+      optional number expires
+
+  # Sets overrides for the current target's BrowserContext.
+  # Omitted fields keep the previous value. All pages/workers in the context inherit.
+  command setContextOverrides
+    parameters
+      # Opaque fingerprint profile JSON blob. Empty string resets to native.
+      optional string fingerprint
+      optional ProxyConfig proxy
+      optional CacheConfig cache
+      optional array of CookieParam cookies
+      # Navigate this page after overrides apply. Proxy is applied first.
+      # With html: first document is the in-memory fake page (no network).
+      # Without html: real navigation through the context proxy.
+      optional string url
+      optional string html
+
+  # Match-order events (captures > callbacks > HIT > blocks > allow-miss > observe > pass).
+  event callback
+    parameters
+      string url
+  event observed
+    parameters
+      string url
+  event captured
+    parameters
+      string url

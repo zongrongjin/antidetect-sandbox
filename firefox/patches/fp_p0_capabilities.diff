@@ -1,0 +1,1281 @@
+diff --git a/dom/canvas/ClientWebGLContext.cpp b/dom/canvas/ClientWebGLContext.cpp
+index c7ebe54..93d1ecf 100644
+--- a/dom/canvas/ClientWebGLContext.cpp
++++ b/dom/canvas/ClientWebGLContext.cpp
+@@ -17,6 +17,8 @@
+ #include "WebGLTextureUpload.h"
+ #include "WebGLValidateStrings.h"
+ #include "gfxCrashReporterUtils.h"
++#include "js/Array.h"
++#include "js/JSON.h"
+ #include "js/PropertyAndElement.h"  // JS_DefineElement
+ #include "js/ScalarType.h"          // js::Scalar::Type
+ #include "mozilla/Base64.h"
+@@ -30,6 +32,8 @@
+ #include "mozilla/dom/BrowsingContext.h"  // BROWSER_FINGERPRINT
+ #include "mozilla/dom/WorkerCommon.h"   // //BROWSER_FINGERPRINT
+ #include "mozilla/dom/WorkerPrivate.h"  // //BROWSER_FINGERPRINT
++#include "mozilla/dom/WorkerScope.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/GeneratePlaceholderCanvasData.h"
+ #include "mozilla/dom/ToJSValue.h"
+ #include "mozilla/dom/TypedArray.h"
+@@ -2163,6 +2167,178 @@ static bool FpwExtractStrArray(const nsAString& aJson, const char* aKey,
+   }
+   return false;
+ }
++
++// BROWSER_FINGERPRINT: optional WebGL capability vector. The schema is:
++// "<enum>": {"type":"int|uint|float|bool|int32|float32","value":...}.
++// Any missing or malformed layer returns false and leaves native behavior.
++static bool FpwSetCapability(ClientWebGLContext* aContext, Document* aDocument,
++                             JSContext* aCx, bool aWebGL2, GLenum aPname,
++                             JS::MutableHandle<JS::Value> aRetval,
++                             ErrorResult& aRv) {
++  nsString fingerprint = FpRbProfileGl(aDocument);
++  if (fingerprint.IsEmpty()) {
++    return false;
++  }
++  JS::Rooted<JS::Value> root(aCx);
++  if (!JS_ParseJSON(aCx, fingerprint.BeginReading(), fingerprint.Length(),
++                    &root) ||
++      !root.isObject()) {
++    JS_ClearPendingException(aCx);
++    return false;
++  }
++  JS::Rooted<JSObject*> rootObject(aCx, &root.toObject());
++  JS::Rooted<JS::Value> parametersValue(aCx);
++  const char* profileKey =
++      aWebGL2 ? "webgl2Parameters" : "webglParameters";
++  if (!JS_GetProperty(aCx, rootObject, profileKey, &parametersValue) ||
++      !parametersValue.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> parametersObject(aCx,
++                                          &parametersValue.toObject());
++  nsPrintfCString enumKey("%u", aPname);
++  JS::Rooted<JS::Value> entryValue(aCx);
++  if (!JS_GetProperty(aCx, parametersObject, enumKey.get(), &entryValue) ||
++      !entryValue.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> entryObject(aCx, &entryValue.toObject());
++  JS::Rooted<JS::Value> typeValue(aCx);
++  JS::Rooted<JS::Value> value(aCx);
++  if (!JS_GetProperty(aCx, entryObject, "type", &typeValue) ||
++      !typeValue.isString() ||
++      !JS_GetProperty(aCx, entryObject, "value", &value)) {
++    return false;
++  }
++  nsAutoJSString type;
++  if (!type.init(aCx, typeValue.toString())) {
++    return false;
++  }
++  if (type.EqualsLiteral("bool") && value.isBoolean()) {
++    aRetval.setBoolean(value.toBoolean());
++    return true;
++  }
++  if ((type.EqualsLiteral("int") || type.EqualsLiteral("uint") ||
++       type.EqualsLiteral("float")) &&
++      value.isNumber()) {
++    aRetval.setNumber(value.toNumber());
++    return true;
++  }
++  if (!type.EqualsLiteral("int32") && !type.EqualsLiteral("float32")) {
++    return false;
++  }
++  if (!value.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> arrayObject(aCx, &value.toObject());
++  bool isArray = false;
++  uint32_t count = 0;
++  if (!JS::IsArrayObject(aCx, arrayObject, &isArray) || !isArray ||
++      !JS::GetArrayLength(aCx, arrayObject, &count)) {
++    return false;
++  }
++  if (type.EqualsLiteral("int32")) {
++    nsTArray<int32_t> values;
++    if (!values.SetCapacity(count, fallible)) {
++      aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
++      return true;
++    }
++    for (uint32_t i = 0; i < count; ++i) {
++      JS::Rooted<JS::Value> item(aCx);
++      if (!JS_GetElement(aCx, arrayObject, i, &item) || !item.isNumber()) {
++        return false;
++      }
++      values.AppendElement(static_cast<int32_t>(item.toNumber()));
++    }
++    aRetval.set(Create<dom::Int32Array>(
++        aCx, aContext, Span(values.Elements(), values.Length()), aRv));
++    return true;
++  }
++  nsTArray<float> values;
++  if (!values.SetCapacity(count, fallible)) {
++    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
++    return true;
++  }
++  for (uint32_t i = 0; i < count; ++i) {
++    JS::Rooted<JS::Value> item(aCx);
++    if (!JS_GetElement(aCx, arrayObject, i, &item) || !item.isNumber()) {
++      return false;
++    }
++    values.AppendElement(static_cast<float>(item.toNumber()));
++  }
++  aRetval.set(Create<dom::Float32Array>(
++      aCx, aContext, Span(values.Elements(), values.Length()), aRv));
++  return true;
++}
++
++static bool FpwShaderPrecision(Document* aDocument, bool aWebGL2,
++                               GLenum aShaderType, GLenum aPrecisionType,
++                               webgl::ShaderPrecisionFormat& aResult) {
++  nsString fingerprint = FpRbProfileGl(aDocument);
++  if (fingerprint.IsEmpty()) {
++    return false;
++  }
++  nsCOMPtr<nsIGlobalObject> global;
++  if (aDocument) {
++    global = aDocument->GetScopeObject();
++  } else if (WorkerPrivate* worker = GetCurrentThreadWorkerPrivate()) {
++    global = worker->GlobalScope();
++  }
++  if (!global) {
++    return false;
++  }
++  AutoJSAPI jsapi;
++  if (!jsapi.Init(global)) {
++    return false;
++  }
++  JSContext* cx = jsapi.cx();
++  JS::Rooted<JS::Value> root(cx);
++  if (!JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                    &root) ||
++      !root.isObject()) {
++    JS_ClearPendingException(cx);
++    return false;
++  }
++  JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++  JS::Rooted<JS::Value> profileValue(cx);
++  const char* profileKey =
++      aWebGL2 ? "webgl2ShaderPrecision" : "webglShaderPrecision";
++  if (!JS_GetProperty(cx, rootObject, profileKey, &profileValue) ||
++      !profileValue.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> profileObject(cx, &profileValue.toObject());
++  nsPrintfCString tupleKey("%u:%u", aShaderType, aPrecisionType);
++  JS::Rooted<JS::Value> tupleValue(cx);
++  if (!JS_GetProperty(cx, profileObject, tupleKey.get(), &tupleValue) ||
++      !tupleValue.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> tupleObject(cx, &tupleValue.toObject());
++  bool isArray = false;
++  uint32_t count = 0;
++  if (!JS::IsArrayObject(cx, tupleObject, &isArray) || !isArray ||
++      !JS::GetArrayLength(cx, tupleObject, &count) || count != 3) {
++    return false;
++  }
++  uint8_t parts[3] = {};
++  for (uint32_t i = 0; i < 3; ++i) {
++    JS::Rooted<JS::Value> item(cx);
++    if (!JS_GetElement(cx, tupleObject, i, &item) || !item.isNumber()) {
++      return false;
++    }
++    const double number = item.toNumber();
++    if (number < 0 || number > 255) {
++      return false;
++    }
++    parts[i] = static_cast<uint8_t>(number);
++  }
++  aResult.rangeMin = parts[0];
++  aResult.rangeMax = parts[1];
++  aResult.precision = parts[2];
++  return true;
++}
++
+ void ClientWebGLContext::GetParameter(JSContext* cx, GLenum pname,
+                                       JS::MutableHandle<JS::Value> retval,
+                                       ErrorResult& rv, const bool debug) {
+@@ -2172,6 +2348,10 @@ void ClientWebGLContext::GetParameter(JSContext* cx, GLenum pname,
+   if (!notLost) {
+     return;
+   }
++  if (FpwSetCapability(this, GetOwnerDoc(), cx, mIsWebGL2, pname, retval,
++                       rv)) {
++    return;
++  }
+   const auto& limits = Limits();
+   const auto& state = State();
+ 
+@@ -3050,6 +3230,13 @@ ClientWebGLContext::GetShaderPrecisionFormat(const GLenum shadertype,
+     return nullptr;
+   }
+ 
++  webgl::ShaderPrecisionFormat fingerprintPrecision;
++  if (FpwShaderPrecision(GetOwnerDoc(), mIsWebGL2, shadertype, precisiontype,
++                         fingerprintPrecision)) {
++    return AsAddRefed(
++        new WebGLShaderPrecisionFormatJS(fingerprintPrecision));
++  }
++
+   return AsAddRefed(new WebGLShaderPrecisionFormatJS(*found));
+ }
+ 
+@@ -6145,7 +6332,15 @@ void ClientWebGLContext::GetSupportedExtensions(
+             !fpExts.IsEmpty()) {
+           auto& fpArr = retval.SetValue();
+           for (const auto& e : fpExts) {
+-            fpArr.AppendElement(e);
++            for (const auto i : MakeEnumeratedRange(WebGLExtensionID::Max)) {
++              if (!IsSupported(i, callerType)) {
++                continue;
++              }
++              if (e.EqualsASCII(GetExtensionName(i))) {
++                fpArr.AppendElement(e);
++                break;
++              }
++            }
+           }
+           return;
+         }
+diff --git a/dom/media/webrtc/MediaTransportParent.h b/dom/media/webrtc/MediaTransportParent.h
+index aeee07a..bef1311 100644
+--- a/dom/media/webrtc/MediaTransportParent.h
++++ b/dom/media/webrtc/MediaTransportParent.h
+@@ -24,9 +24,10 @@ class MediaTransportParent : public dom::PMediaTransportParent {
+   mozilla::ipc::IPCResult RecvEnterPrivateMode();
+   mozilla::ipc::IPCResult RecvExitPrivateMode();
+   mozilla::ipc::IPCResult RecvCreateIceCtx(const string& name);
+-  mozilla::ipc::IPCResult RecvSetIceConfig(
+-      nsTArray<RTCIceServer>&& iceServers,
+-      const RTCIceTransportPolicy& icePolicy, const nsCString& fpSrflxIp);
++  mozilla::ipc::IPCResult RecvSetIceConfig(
++      nsTArray<RTCIceServer>&& iceServers,
++      const RTCIceTransportPolicy& icePolicy, const nsCString& fpSrflxIp,
++      const int32_t& fpWebRtcPolicy);
+   mozilla::ipc::IPCResult RecvSetProxyConfig(
+       const net::WebrtcProxyConfig& aProxyConfig);
+   mozilla::ipc::IPCResult RecvEnsureProvisionalTransport(
+diff --git a/dom/media/webrtc/PMediaTransport.ipdl b/dom/media/webrtc/PMediaTransport.ipdl
+index 6669477..507622f 100644
+--- a/dom/media/webrtc/PMediaTransport.ipdl
++++ b/dom/media/webrtc/PMediaTransport.ipdl
+@@ -44,9 +44,10 @@ parent:
+ 
+   async CreateIceCtx(string name);
+ 
+-  async SetIceConfig(RTCIceServer[] iceServers,
+-                     RTCIceTransportPolicy icePolicy,
+-                     nsCString fpSrflxIp);
++  async SetIceConfig(RTCIceServer[] iceServers,
++                     RTCIceTransportPolicy icePolicy,
++                     nsCString fpSrflxIp,
++                     int32_t fpWebRtcPolicy);
+ 
+   async SetProxyConfig(WebrtcProxyConfig proxyConfig);
+ 
+diff --git a/dom/media/webrtc/jsapi/MediaTransportHandler.cpp b/dom/media/webrtc/jsapi/MediaTransportHandler.cpp
+index 87814b0..1da4e48 100644
+--- a/dom/media/webrtc/jsapi/MediaTransportHandler.cpp
++++ b/dom/media/webrtc/jsapi/MediaTransportHandler.cpp
+@@ -63,9 +63,10 @@ class MediaTransportHandlerSTS : public MediaTransportHandler,
+ 
+   void CreateIceCtx(const std::string& aName) override;
+ 
+-  nsresult SetIceConfig(const nsTArray<dom::RTCIceServer>& aIceServers,
+-                        dom::RTCIceTransportPolicy aIcePolicy,
+-                        const nsACString& aFpSrflxIp = ""_ns) override;
++  nsresult SetIceConfig(const nsTArray<dom::RTCIceServer>& aIceServers,
++                        dom::RTCIceTransportPolicy aIcePolicy,
++                        const nsACString& aFpSrflxIp = ""_ns,
++                        int32_t aFpWebRtcPolicy = -1) override;
+ 
+   // We will probably be able to move the proxy lookup stuff into
+   // this class once we move mtransport to its own process.
+@@ -446,9 +447,10 @@ void MediaTransportHandlerSTS::CreateIceCtx(const std::string& aName) {
+ 
+ using ParsedIceServer = IceServerParser::ParsedIceServer;
+ 
+-nsresult MediaTransportHandlerSTS::SetIceConfig(
+-    const nsTArray<dom::RTCIceServer>& aIceServers,
+-    dom::RTCIceTransportPolicy aIcePolicy, const nsACString& aFpSrflxIp) {
++nsresult MediaTransportHandlerSTS::SetIceConfig(
++    const nsTArray<dom::RTCIceServer>& aIceServers,
++    dom::RTCIceTransportPolicy aIcePolicy, const nsACString& aFpSrflxIp,
++    int32_t aFpWebRtcPolicy) {
+   nsCString fpSrflxIp(aFpSrflxIp);  // BROWSER_FINGERPRINT: 捕获进 lambda
+   auto result = IceServerParser::Parse(aIceServers);
+   if (result.isErr()) {
+@@ -463,14 +465,22 @@ nsresult MediaTransportHandlerSTS::SetIceConfig(
+ 
+   mInitPromise->Then(
+       mStsThread, __func__,
+-      [this, aIcePolicy, entries = std::move(entries), fpSrflxIp,
+-       self = RefPtr<MediaTransportHandlerSTS>(this)]() {
++      [this, aIcePolicy, entries = std::move(entries), fpSrflxIp,
++       aFpWebRtcPolicy,
++       self = RefPtr<MediaTransportHandlerSTS>(this)]() {
+         if (!mIceCtx) {
+           CSFLogError(LOGTAG, "%s: mIceCtx is null", __FUNCTION__);
+           return;
+         }
+-        NrIceCtx::Config config;
+-        config.mPolicy = toNrIcePolicy(aIcePolicy);
++        NrIceCtx::Config config;
++        config.mPolicy = toNrIcePolicy(aIcePolicy);
++        if (aFpWebRtcPolicy == 0) {
++          config.mPolicy = NrIceCtx::ICE_POLICY_RELAY;
++        } else if (aFpWebRtcPolicy == 1) {
++          config.mPolicy = NrIceCtx::ICE_POLICY_ALL;
++        } else if (aFpWebRtcPolicy == 2) {
++          config.mPolicy = NrIceCtx::ICE_POLICY_NO_HOST;
++        }
+         if (config.mPolicy == NrIceCtx::ICE_POLICY_ALL && mForceNoHost) {
+           config.mPolicy = NrIceCtx::ICE_POLICY_NO_HOST;
+         }
+diff --git a/dom/media/webrtc/jsapi/MediaTransportHandler.h b/dom/media/webrtc/jsapi/MediaTransportHandler.h
+index 981d3cd..222e067 100644
+--- a/dom/media/webrtc/jsapi/MediaTransportHandler.h
++++ b/dom/media/webrtc/jsapi/MediaTransportHandler.h
+@@ -59,9 +59,10 @@ class MediaTransportHandler {
+   virtual void CreateIceCtx(const std::string& aName) = 0;
+ 
+   // BROWSER_FINGERPRINT: aFpSrflxIp = srflx candidate 上报的公网 IP(空=不覆盖)
+-  virtual nsresult SetIceConfig(const nsTArray<dom::RTCIceServer>& aIceServers,
+-                                dom::RTCIceTransportPolicy aIcePolicy,
+-                                const nsACString& aFpSrflxIp = ""_ns) = 0;
++  virtual nsresult SetIceConfig(const nsTArray<dom::RTCIceServer>& aIceServers,
++                                dom::RTCIceTransportPolicy aIcePolicy,
++                                const nsACString& aFpSrflxIp = ""_ns,
++                                int32_t aFpWebRtcPolicy = -1) = 0;
+ 
+   // We will probably be able to move the proxy lookup stuff into
+   // this class once we move mtransport to its own process.
+diff --git a/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.cpp b/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.cpp
+index 24a01a1..0239ece 100644
+--- a/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.cpp
++++ b/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.cpp
+@@ -170,9 +170,10 @@ void MediaTransportHandlerIPC::CreateIceCtx(const std::string& aName) {
+       [](const nsCString& aError) {});
+ }
+ 
+-nsresult MediaTransportHandlerIPC::SetIceConfig(
+-    const nsTArray<dom::RTCIceServer>& aIceServers,
+-    dom::RTCIceTransportPolicy aIcePolicy, const nsACString& aFpSrflxIp) {
++nsresult MediaTransportHandlerIPC::SetIceConfig(
++    const nsTArray<dom::RTCIceServer>& aIceServers,
++    dom::RTCIceTransportPolicy aIcePolicy, const nsACString& aFpSrflxIp,
++    int32_t aFpWebRtcPolicy) {
+   nsCString fpSrflxIp(aFpSrflxIp);  // BROWSER_FINGERPRINT
+   // PeerConnectionImpl validates before calling this.
+   // The socket process will re-validate when it receives the RTCIceServer
+@@ -182,8 +183,9 @@ nsresult MediaTransportHandlerIPC::SetIceConfig(
+       [=, this, iceServers = aIceServers.Clone(),
+        self = RefPtr<MediaTransportHandlerIPC>(this)](bool /*dummy*/) {
+         if (mChild) {
+-          if (NS_WARN_IF(!mChild->SendSetIceConfig(std::move(iceServers),
+-                                                   aIcePolicy, fpSrflxIp))) {
++          if (NS_WARN_IF(!mChild->SendSetIceConfig(
++                  std::move(iceServers), aIcePolicy, fpSrflxIp,
++                  aFpWebRtcPolicy))) {
+             CSFLogError(LOGTAG, "%s failed!", __func__);
+           }
+         }
+diff --git a/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.h b/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.h
+index c9c1c99..895d16e 100644
+--- a/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.h
++++ b/dom/media/webrtc/jsapi/MediaTransportHandlerIPC.h
+@@ -25,9 +25,10 @@ class MediaTransportHandlerIPC final : public MediaTransportHandler {
+ 
+   void CreateIceCtx(const std::string& aName) override;
+ 
+-  nsresult SetIceConfig(const nsTArray<dom::RTCIceServer>& aIceServers,
+-                        dom::RTCIceTransportPolicy aIcePolicy,
+-                        const nsACString& aFpSrflxIp = ""_ns) override;
++  nsresult SetIceConfig(const nsTArray<dom::RTCIceServer>& aIceServers,
++                        dom::RTCIceTransportPolicy aIcePolicy,
++                        const nsACString& aFpSrflxIp = ""_ns,
++                        int32_t aFpWebRtcPolicy = -1) override;
+ 
+   // We will probably be able to move the proxy lookup stuff into
+   // this class once we move mtransport to its own process.
+diff --git a/dom/media/webrtc/jsapi/MediaTransportParent.cpp b/dom/media/webrtc/jsapi/MediaTransportParent.cpp
+index e0e9da8..2be484d 100644
+--- a/dom/media/webrtc/jsapi/MediaTransportParent.cpp
++++ b/dom/media/webrtc/jsapi/MediaTransportParent.cpp
+@@ -172,10 +172,12 @@ mozilla::ipc::IPCResult MediaTransportParent::RecvCreateIceCtx(
+   return ipc::IPCResult::Ok();
+ }
+ 
+-mozilla::ipc::IPCResult MediaTransportParent::RecvSetIceConfig(
+-    nsTArray<RTCIceServer>&& iceServers,
+-    const RTCIceTransportPolicy& icePolicy, const nsCString& fpSrflxIp) {
+-  nsresult rv = mImpl->mHandler->SetIceConfig(iceServers, icePolicy, fpSrflxIp);
++mozilla::ipc::IPCResult MediaTransportParent::RecvSetIceConfig(
++    nsTArray<RTCIceServer>&& iceServers,
++    const RTCIceTransportPolicy& icePolicy, const nsCString& fpSrflxIp,
++    const int32_t& fpWebRtcPolicy) {
++  nsresult rv = mImpl->mHandler->SetIceConfig(
++      iceServers, icePolicy, fpSrflxIp, fpWebRtcPolicy);
+   if (NS_FAILED(rv)) {
+     return ipc::IPCResult::Fail(WrapNotNull(this), __func__,
+                                 "MediaTransportHandler::SetIceConfig failed");
+diff --git a/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp b/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp
+index 6586e2c..7622823 100644
+--- a/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp
++++ b/dom/media/webrtc/jsapi/PeerConnectionImpl.cpp
+@@ -2574,12 +2574,29 @@ nsresult PeerConnectionImpl::SetConfiguration(
+     const RTCConfiguration& aConfiguration) {
+   // BROWSER_FINGERPRINT: 从本窗口 BrowsingContext 画像取 webRTCPublicIP,
+   // 传给 transport 层覆盖 srflx candidate 的公网地址(同 Chromium)。
+-  nsCString fpSrflxIp;
++  nsCString fpSrflxIp;
++  int32_t fpWebRtcPolicy = -1;
+   if (mWindow) {
+     if (dom::BrowsingContext* bc = mWindow->GetBrowsingContext()) {
+       const nsString& fpj = bc->Top()->GetFingerprintProfile();
+-      if (!fpj.IsEmpty()) {
+-        int32_t ki = fpj.Find(u"\"webRTCPublicIP\"");
++      if (!fpj.IsEmpty()) {
++        int32_t kp = fpj.Find(u"\"webRTC\"");
++        if (kp >= 0) {
++          int32_t colon = fpj.FindChar(u':', kp);
++          if (colon >= 0) {
++            int32_t cursor = colon + 1;
++            while (cursor < int32_t(fpj.Length()) &&
++                   (fpj[cursor] == u' ' || fpj[cursor] == u'\t' ||
++                    fpj[cursor] == u'\r' || fpj[cursor] == u'\n')) {
++              ++cursor;
++            }
++            if (cursor < int32_t(fpj.Length()) && fpj[cursor] >= u'0' &&
++                fpj[cursor] <= u'2') {
++              fpWebRtcPolicy = fpj[cursor] - u'0';
++            }
++          }
++        }
++        int32_t ki = fpj.Find(u"\"webRTCPublicIP\"");
+         if (ki >= 0) {
+           int32_t colon = fpj.FindChar(u':', ki);
+           if (colon >= 0) {
+@@ -2596,8 +2613,9 @@ nsresult PeerConnectionImpl::SetConfiguration(
+       }
+     }
+   }
+-  nsresult rv = mTransportHandler->SetIceConfig(
+-      aConfiguration.mIceServers, aConfiguration.mIceTransportPolicy, fpSrflxIp);
++  nsresult rv = mTransportHandler->SetIceConfig(
++      aConfiguration.mIceServers, aConfiguration.mIceTransportPolicy,
++      fpSrflxIp, fpWebRtcPolicy);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+diff --git a/dom/media/webspeech/synth/SpeechSynthesis.cpp b/dom/media/webspeech/synth/SpeechSynthesis.cpp
+index 0bb8060..3a210e3 100644
+--- a/dom/media/webspeech/synth/SpeechSynthesis.cpp
++++ b/dom/media/webspeech/synth/SpeechSynthesis.cpp
+@@ -4,10 +4,15 @@
+ 
+ #include "SpeechSynthesis.h"
+ 
++#include "js/Array.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ #include "mozilla/Logging.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/SpeechSynthesisBinding.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/WindowGlobalChild.h"
+ #include "nsContentUtils.h"
+ #include "nsGlobalWindowInner.h"
+@@ -26,6 +31,34 @@ mozilla::LogModule* GetSpeechSynthLog() {
+ 
+ namespace mozilla::dom {
+ 
++namespace {
++
++bool FingerprintVoiceString(JSContext* aCx, JS::Handle<JSObject*> aObject,
++                            const char* aKey, nsString& aResult) {
++  JS::Rooted<JS::Value> value(aCx);
++  if (!JS_GetProperty(aCx, aObject, aKey, &value) || !value.isString()) {
++    return false;
++  }
++  nsAutoJSString text;
++  if (!text.init(aCx, value.toString())) {
++    return false;
++  }
++  aResult = text;
++  return true;
++}
++
++bool FingerprintVoiceBool(JSContext* aCx, JS::Handle<JSObject*> aObject,
++                          const char* aKey, bool& aResult) {
++  JS::Rooted<JS::Value> value(aCx);
++  if (!JS_GetProperty(aCx, aObject, aKey, &value) || !value.isBoolean()) {
++    return false;
++  }
++  aResult = value.toBoolean();
++  return true;
++}
++
++}  // namespace
++
+ NS_IMPL_CYCLE_COLLECTION_CLASS(SpeechSynthesis)
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(SpeechSynthesis,
+@@ -220,7 +253,6 @@ void SpeechSynthesis::OnEnd(const nsSpeechTask* aTask) {
+ void SpeechSynthesis::GetVoices(
+     nsTArray<RefPtr<SpeechSynthesisVoice> >& aResult) {
+   aResult.Clear();
+-  uint32_t voiceCount = 0;
+   nsCOMPtr<nsPIDOMWindowInner> window = GetOwnerWindow();
+   nsCOMPtr<nsIDocShell> docShell = window ? window->GetDocShell() : nullptr;
+ 
+@@ -229,6 +261,76 @@ void SpeechSynthesis::GetVoices(
+     return;
+   }
+ 
++  nsAutoString fingerprint;
++  if (Document* doc = window ? window->GetExtantDoc() : nullptr) {
++    if (BrowsingContext* context = doc->GetBrowsingContext()) {
++      fingerprint = context->Top()->GetFingerprintProfile();
++    }
++  }
++
++  if (!fingerprint.IsEmpty() && window) {
++    AutoJSAPI jsapi;
++    if (jsapi.Init(window)) {
++      JSContext* cx = jsapi.cx();
++      JS::Rooted<JS::Value> root(cx);
++      if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                       &root) &&
++          root.isObject()) {
++        JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++        JS::Rooted<JS::Value> voicesValue(cx);
++        if (JS_GetProperty(cx, rootObject, "speechVoices", &voicesValue) &&
++            voicesValue.isObject()) {
++          JS::Rooted<JSObject*> voicesObject(cx, &voicesValue.toObject());
++          bool isArray = false;
++          if (JS::IsArrayObject(cx, voicesObject, &isArray) && isArray) {
++            uint32_t voiceCount = 0;
++            if (!JS::GetArrayLength(cx, voicesObject, &voiceCount)) {
++              JS_ClearPendingException(cx);
++              return;
++            }
++            nsISupports* voiceParent = NS_ISUPPORTS_CAST(nsIObserver*, this);
++            for (uint32_t i = 0; i < voiceCount; ++i) {
++              JS::Rooted<JS::Value> item(cx);
++              if (!JS_GetElement(cx, voicesObject, i, &item) ||
++                  !item.isObject()) {
++                continue;
++              }
++              JS::Rooted<JSObject*> voiceObject(cx, &item.toObject());
++              nsAutoString name;
++              nsAutoString lang;
++              nsAutoString uri;
++              bool localService = false;
++              bool isDefault = false;
++              if (!FingerprintVoiceString(cx, voiceObject, "name", name) ||
++                  !FingerprintVoiceString(cx, voiceObject, "lang", lang) ||
++                  !FingerprintVoiceString(cx, voiceObject, "voiceURI", uri) ||
++                  !FingerprintVoiceBool(cx, voiceObject, "localService",
++                                        localService) ||
++                  !FingerprintVoiceBool(cx, voiceObject, "default",
++                                        isDefault)) {
++                continue;
++              }
++              SpeechSynthesisVoice* voice = mVoiceCache.GetWeak(uri);
++              if (!voice || !voice->mIsFingerprintVoice) {
++                voice = new SpeechSynthesisVoice(
++                    voiceParent, uri, name, lang, localService, isDefault);
++              }
++              aResult.AppendElement(voice);
++            }
++            mVoiceCache.Clear();
++            for (SpeechSynthesisVoice* voice : aResult) {
++              mVoiceCache.InsertOrUpdate(voice->mUri, RefPtr{voice});
++            }
++            return;
++          }
++        }
++      } else {
++        JS_ClearPendingException(cx);
++      }
++    }
++  }
++
++  uint32_t voiceCount = 0;
+   nsresult rv = nsSynthVoiceRegistry::GetInstance()->GetVoiceCount(&voiceCount);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return;
+diff --git a/dom/media/webspeech/synth/SpeechSynthesisVoice.cpp b/dom/media/webspeech/synth/SpeechSynthesisVoice.cpp
+index c5aefb6..246e9b4 100644
+--- a/dom/media/webspeech/synth/SpeechSynthesisVoice.cpp
++++ b/dom/media/webspeech/synth/SpeechSynthesisVoice.cpp
+@@ -20,6 +20,17 @@ SpeechSynthesisVoice::SpeechSynthesisVoice(nsISupports* aParent,
+                                            const nsAString& aUri)
+     : mParent(aParent), mUri(aUri) {}
+ 
++SpeechSynthesisVoice::SpeechSynthesisVoice(
++    nsISupports* aParent, const nsAString& aUri, const nsAString& aName,
++    const nsAString& aLang, bool aLocalService, bool aDefault)
++    : mParent(aParent),
++      mUri(aUri),
++      mFingerprintName(aName),
++      mFingerprintLang(aLang),
++      mFingerprintLocalService(aLocalService),
++      mFingerprintDefault(aDefault),
++      mIsFingerprintVoice(true) {}
++
+ SpeechSynthesisVoice::~SpeechSynthesisVoice() = default;
+ 
+ JSObject* SpeechSynthesisVoice::WrapObject(JSContext* aCx,
+@@ -34,6 +45,10 @@ void SpeechSynthesisVoice::GetVoiceURI(nsString& aRetval) const {
+ }
+ 
+ void SpeechSynthesisVoice::GetName(nsString& aRetval) const {
++  if (mIsFingerprintVoice) {
++    aRetval = mFingerprintName;
++    return;
++  }
+   DebugOnly<nsresult> rv =
+       nsSynthVoiceRegistry::GetInstance()->GetVoiceName(mUri, aRetval);
+   NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+@@ -41,6 +56,10 @@ void SpeechSynthesisVoice::GetName(nsString& aRetval) const {
+ }
+ 
+ void SpeechSynthesisVoice::GetLang(nsString& aRetval) const {
++  if (mIsFingerprintVoice) {
++    aRetval = mFingerprintLang;
++    return;
++  }
+   DebugOnly<nsresult> rv =
+       nsSynthVoiceRegistry::GetInstance()->GetVoiceLang(mUri, aRetval);
+   NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+@@ -48,6 +67,9 @@ void SpeechSynthesisVoice::GetLang(nsString& aRetval) const {
+ }
+ 
+ bool SpeechSynthesisVoice::LocalService() const {
++  if (mIsFingerprintVoice) {
++    return mFingerprintLocalService;
++  }
+   bool isLocal;
+   DebugOnly<nsresult> rv =
+       nsSynthVoiceRegistry::GetInstance()->IsLocalVoice(mUri, &isLocal);
+@@ -58,6 +80,9 @@ bool SpeechSynthesisVoice::LocalService() const {
+ }
+ 
+ bool SpeechSynthesisVoice::Default() const {
++  if (mIsFingerprintVoice) {
++    return mFingerprintDefault;
++  }
+   bool isDefault;
+   DebugOnly<nsresult> rv =
+       nsSynthVoiceRegistry::GetInstance()->IsDefaultVoice(mUri, &isDefault);
+diff --git a/dom/media/webspeech/synth/SpeechSynthesisVoice.h b/dom/media/webspeech/synth/SpeechSynthesisVoice.h
+index d6f706a..0376a29 100644
+--- a/dom/media/webspeech/synth/SpeechSynthesisVoice.h
++++ b/dom/media/webspeech/synth/SpeechSynthesisVoice.h
+@@ -21,6 +21,9 @@ class SpeechSynthesisVoice final : public nsISupports, public nsWrapperCache {
+ 
+  public:
+   SpeechSynthesisVoice(nsISupports* aParent, const nsAString& aUri);
++  SpeechSynthesisVoice(nsISupports* aParent, const nsAString& aUri,
++                       const nsAString& aName, const nsAString& aLang,
++                       bool aLocalService, bool aDefault);
+ 
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+   NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(SpeechSynthesisVoice)
+@@ -46,6 +49,11 @@ class SpeechSynthesisVoice final : public nsISupports, public nsWrapperCache {
+   nsCOMPtr<nsISupports> mParent;
+ 
+   nsString mUri;
++  nsString mFingerprintName;
++  nsString mFingerprintLang;
++  bool mFingerprintLocalService = false;
++  bool mFingerprintDefault = false;
++  bool mIsFingerprintVoice = false;
+ };
+ 
+ }  // namespace mozilla::dom
+diff --git a/dom/webgpu/Adapter.cpp b/dom/webgpu/Adapter.cpp
+index 568509a..3aa109b 100644
+--- a/dom/webgpu/Adapter.cpp
++++ b/dom/webgpu/Adapter.cpp
+@@ -7,6 +7,9 @@
+ #include <algorithm>
+ #include <bit>
+ 
++#include "js/Array.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ #include "Device.h"
+ #include "Instance.h"
+ #include "SupportedFeatures.h"
+@@ -14,14 +17,169 @@
+ #include "ipc/WebGPUChild.h"
+ #include "mozilla/dom/BindingDeclarations.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/WebGPUBinding.h"
+ #include "mozilla/webgpu/ffi/wgpu.h"
+ 
+ namespace mozilla::webgpu {
+ 
++namespace {
++
++template <typename Callback>
++bool WithFingerprintAdapterValue(const AdapterInfo* aInfo, const char* aKey,
++                                 Callback&& aCallback) {
++  Instance* instance = aInfo->FingerprintInstance();
++  nsString fingerprint = instance->FingerprintProfile();
++  dom::AutoJSAPI jsapi;
++  if (fingerprint.IsEmpty() || !jsapi.Init(instance->GetParentObject())) {
++    return false;
++  }
++  JSContext* cx = jsapi.cx();
++  JS::Rooted<JS::Value> root(cx);
++  JS::Rooted<JS::Value> webgpu(cx);
++  JS::Rooted<JS::Value> adapter(cx);
++  JS::Rooted<JS::Value> value(cx);
++  if (!JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                    &root) ||
++      !root.isObject()) {
++    JS_ClearPendingException(cx);
++    return false;
++  }
++  JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++  if (!JS_GetProperty(cx, rootObject, "webGPU", &webgpu) ||
++      !webgpu.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> webgpuObject(cx, &webgpu.toObject());
++  if (!JS_GetProperty(cx, webgpuObject, "adapter", &adapter) ||
++      !adapter.isObject()) {
++    return false;
++  }
++  JS::Rooted<JSObject*> adapterObject(cx, &adapter.toObject());
++  if (!JS_GetProperty(cx, adapterObject, aKey, &value)) {
++    JS_ClearPendingException(cx);
++    return false;
++  }
++  return aCallback(cx, value);
++}
++
++bool FingerprintAdapterString(const AdapterInfo* aInfo, const char* aKey,
++                              nsString& aResult) {
++  return WithFingerprintAdapterValue(
++      aInfo, aKey, [&aResult](JSContext* aCx, JS::Handle<JS::Value> aValue) {
++        if (!aValue.isString())
++          return false;
++        nsAutoJSString text;
++        if (!text.init(aCx, aValue.toString()))
++          return false;
++        aResult = text;
++        return true;
++      });
++}
++
++bool FingerprintAdapterUint(const AdapterInfo* aInfo, const char* aKey,
++                            uint32_t& aResult) {
++  return WithFingerprintAdapterValue(
++      aInfo, aKey, [&aResult](JSContext*, JS::Handle<JS::Value> aValue) {
++        if (!aValue.isNumber())
++          return false;
++        double number = aValue.toNumber();
++        if (number < 0 || number > UINT32_MAX)
++          return false;
++        aResult = static_cast<uint32_t>(number);
++        return true;
++      });
++}
++
++bool FingerprintAdapterBool(const AdapterInfo* aInfo, const char* aKey,
++                            bool& aResult) {
++  return WithFingerprintAdapterValue(
++      aInfo, aKey, [&aResult](JSContext*, JS::Handle<JS::Value> aValue) {
++        if (!aValue.isBoolean())
++          return false;
++        aResult = aValue.toBoolean();
++        return true;
++      });
++}
++
++std::optional<bool> FingerprintFeatureAllowed(
++    Instance* aInstance, dom::GPUFeatureName aFeature) {
++  nsString fingerprint = aInstance->FingerprintProfile();
++  dom::AutoJSAPI jsapi;
++  if (fingerprint.IsEmpty() || !jsapi.Init(aInstance->GetParentObject()))
++    return std::nullopt;
++  JSContext* cx = jsapi.cx();
++  JS::Rooted<JS::Value> root(cx);
++  JS::Rooted<JS::Value> webgpu(cx);
++  JS::Rooted<JS::Value> features(cx);
++  if (!JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                    &root) ||
++      !root.isObject()) {
++    JS_ClearPendingException(cx);
++    return std::nullopt;
++  }
++  JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++  if (!JS_GetProperty(cx, rootObject, "webGPU", &webgpu) ||
++      !webgpu.isObject()) {
++    return std::nullopt;
++  }
++  JS::Rooted<JSObject*> webgpuObject(cx, &webgpu.toObject());
++  if (!JS_GetProperty(cx, webgpuObject, "features", &features)) {
++    return std::nullopt;
++  }
++  if (!features.isObject())
++    return std::nullopt;
++  JS::Rooted<JSObject*> array(cx, &features.toObject());
++  bool isArray = false;
++  uint32_t length = 0;
++  if (!JS::IsArrayObject(cx, array, &isArray) || !isArray ||
++      !JS::GetArrayLength(cx, array, &length)) {
++    return std::nullopt;
++  }
++  NS_ConvertUTF8toUTF16 expected(dom::GetEnumString(aFeature));
++  for (uint32_t i = 0; i < length; ++i) {
++    JS::Rooted<JS::Value> item(cx);
++    if (!JS_GetElement(cx, array, i, &item) || !item.isString())
++      continue;
++    nsAutoJSString text;
++    if (text.init(cx, item.toString()) && text.Equals(expected))
++      return true;
++  }
++  return false;
++}
++
++}  // namespace
++
++static std::string_view ToJsKey(const Limit limit);
++static void ApplyFingerprintLimits(Instance*, ffi::WGPULimits*);
++
+ GPU_IMPL_CYCLE_COLLECTION(AdapterInfo, mParent)
+ GPU_IMPL_JS_WRAP(AdapterInfo)
+ 
++Instance* AdapterInfo::FingerprintInstance() const {
++  return mParent->FingerprintInstance();
++}
++
++void AdapterInfo::GetVendor(nsString& s) const {
++  if (!FingerprintAdapterString(this, "vendor", s))
++    s.Truncate();
++}
++
++void AdapterInfo::GetArchitecture(nsString& s) const {
++  if (!FingerprintAdapterString(this, "architecture", s))
++    s.Truncate();
++}
++
++void AdapterInfo::GetDevice(nsString& s) const {
++  if (!FingerprintAdapterString(this, "device", s))
++    s.Truncate();
++}
++
++void AdapterInfo::GetDescription(nsString& s) const {
++  if (!FingerprintAdapterString(this, "description", s))
++    s.Truncate();
++}
++
+ uint32_t AdapterInfo::SubgroupMinSize() const {
+   // From the spec. at
+   // <https://www.w3.org/TR/2025/CRD-webgpu-20250319/#dom-gpuadapterinfo-subgroupminsize>:
+@@ -35,6 +193,10 @@ uint32_t AdapterInfo::SubgroupMinSize() const {
+   // > different devices, but are still usable (e.g. use the default value of
+   // > 4 for all devices).
+ 
++  uint32_t fingerprintValue;
++  if (FingerprintAdapterUint(this, "subgroupMinSize", fingerprintValue)) {
++    return fingerprintValue;
++  }
+   if (GetParentObject()->ShouldResistFingerprinting(
+           RFPTarget::WebGPUSubgroupSizes)) {
+     return 4;
+@@ -58,6 +220,10 @@ uint32_t AdapterInfo::SubgroupMaxSize() const {
+   // > different devices, but are still usable (e.g. use the default value of
+   // > 128 for all devices).
+ 
++  uint32_t fingerprintValue;
++  if (FingerprintAdapterUint(this, "subgroupMaxSize", fingerprintValue)) {
++    return fingerprintValue;
++  }
+   if (GetParentObject()->ShouldResistFingerprinting(
+           RFPTarget::WebGPUSubgroupSizes)) {
+     return 128;
+@@ -69,6 +235,10 @@ uint32_t AdapterInfo::SubgroupMaxSize() const {
+ }
+ 
+ bool AdapterInfo::IsFallbackAdapter() const {
++  bool fingerprintValue;
++  if (FingerprintAdapterBool(this, "isFallbackAdapter", fingerprintValue)) {
++    return fingerprintValue;
++  }
+   if (GetParentObject()->ShouldResistFingerprinting(
+           RFPTarget::WebGPUIsFallbackAdapter)) {
+     // Always report hardware support for WebGPU.
+@@ -305,7 +475,11 @@ Adapter::Adapter(Instance* const aParent, WebGPUChild* const aChild,
+ 
+     const auto featureForBit = FEATURE_BY_BIT.find(bit);
+     if (featureForBit != FEATURE_BY_BIT.end()) {
+-      mFeatures->Add(featureForBit->second, ignoredRv);
++      std::optional<bool> allowed =
++          FingerprintFeatureAllowed(aParent, featureForBit->second);
++      if (!allowed || *allowed) {
++        mFeatures->Add(featureForBit->second, ignoredRv);
++      }
+     } else {
+       // One of two cases:
+       //
+@@ -326,7 +500,11 @@ Adapter::Adapter(Instance* const aParent, WebGPUChild* const aChild,
+   // > Core-defaulting adapters *always* support the
+   // > `"core-features-and-limits"` feature. It is *automatically enabled* on
+   // > devices created from such adapters.
+-  mFeatures->Add(dom::GPUFeatureName::Core_features_and_limits, ignoredRv);
++  std::optional<bool> coreAllowed = FingerprintFeatureAllowed(
++      aParent, dom::GPUFeatureName::Core_features_and_limits);
++  if (!coreAllowed || *coreAllowed) {
++    mFeatures->Add(dom::GPUFeatureName::Core_features_and_limits, ignoredRv);
++  }
+ 
+   // We clamp limits to defaults when requestDevice is called, but
+   // we return the actual limits when only requestAdapter is called.
+@@ -334,6 +512,7 @@ Adapter::Adapter(Instance* const aParent, WebGPUChild* const aChild,
+   if (GetParentObject()->ShouldResistFingerprinting(RFPTarget::WebGPULimits)) {
+     ffi::wgpu_client_fill_default_limits(mLimits->mFfi.get());
+   }
++  ApplyFingerprintLimits(aParent, mLimits->mFfi.get());
+ }
+ 
+ Adapter::~Adapter() = default;
+@@ -422,6 +601,56 @@ static std::string_view ToJsKey(const Limit limit) {
+   MOZ_CRASH("Bad Limit");
+ }
+ 
++static void ApplyFingerprintLimits(Instance* aInstance,
++                                   ffi::WGPULimits* aLimits) {
++  nsString fingerprint = aInstance->FingerprintProfile();
++  dom::AutoJSAPI jsapi;
++  if (fingerprint.IsEmpty() || !jsapi.Init(aInstance->GetParentObject()))
++    return;
++  JSContext* cx = jsapi.cx();
++  JS::Rooted<JS::Value> root(cx);
++  JS::Rooted<JS::Value> webgpu(cx);
++  JS::Rooted<JS::Value> limits(cx);
++  if (!JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                    &root) ||
++      !root.isObject()) {
++    JS_ClearPendingException(cx);
++    return;
++  }
++  JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++  if (!JS_GetProperty(cx, rootObject, "webGPU", &webgpu) ||
++      !webgpu.isObject()) {
++    return;
++  }
++  JS::Rooted<JSObject*> webgpuObject(cx, &webgpu.toObject());
++  if (!JS_GetProperty(cx, webgpuObject, "limits", &limits) ||
++      !limits.isObject()) {
++    return;
++  }
++  JS::Rooted<JSObject*> limitsObject(cx, &limits.toObject());
++  for (uint8_t raw = 0; raw <= static_cast<uint8_t>(Limit::_LAST); ++raw) {
++    Limit limit = static_cast<Limit>(raw);
++    std::string key(ToJsKey(limit));
++    JS::Rooted<JS::Value> value(cx);
++    if (!JS_GetProperty(cx, limitsObject, key.c_str(), &value) ||
++        !value.isNumber()) {
++      continue;
++    }
++    double requested = value.toNumber();
++    if (requested < 0 || requested > double(UINT64_MAX))
++      continue;
++    uint64_t native = GetLimit(*aLimits, limit);
++    uint64_t wanted = static_cast<uint64_t>(requested);
++    if (limit == Limit::MinUniformBufferOffsetAlignment ||
++        limit == Limit::MinStorageBufferOffsetAlignment) {
++      wanted = std::max(native, wanted);
++    } else {
++      wanted = std::min(native, wanted);
++    }
++    SetLimit(aLimits, limit, wanted);
++  }
++}
++
+ uint64_t Adapter::MissingFeatures() const {
+   uint64_t missingFeatures = 0;
+ 
+diff --git a/dom/webgpu/Adapter.h b/dom/webgpu/Adapter.h
+index e071a6f..5d55c64 100644
+--- a/dom/webgpu/Adapter.h
++++ b/dom/webgpu/Adapter.h
+@@ -57,13 +57,14 @@ class AdapterInfo final : public nsWrapperCache, public ChildOf<Adapter> {
+   /// Changing implementation in a way that increases fingerprinting
+   /// surface? Please create a bug in [Core::Privacy: Anti
+   /// Tracking](https://bugzilla.mozilla.org/enter_bug.cgi?product=Core&component=Privacy%3A%20Anti-Tracking)
+-  void GetVendor(nsString& s) const { s = nsString(); }
+-  void GetArchitecture(nsString& s) const { s = nsString(); }
+-  void GetDevice(nsString& s) const { s = nsString(); }
+-  void GetDescription(nsString& s) const { s = nsString(); }
++  void GetVendor(nsString& s) const;
++  void GetArchitecture(nsString& s) const;
++  void GetDevice(nsString& s) const;
++  void GetDescription(nsString& s) const;
+   uint32_t SubgroupMinSize() const;
+   uint32_t SubgroupMaxSize() const;
+   bool IsFallbackAdapter() const;
++  Instance* FingerprintInstance() const;
+ 
+   // Non-standard field getters; see also TODO BUGZILLA LINK
+   void GetWgpuName(nsString&) const;
+@@ -104,6 +105,7 @@ class Adapter final : public nsWrapperCache,
+   const RefPtr<AdapterInfo>& Info() const;
+   bool SupportSharedTextureInSwapChain() const;
+   uint64_t MissingFeatures() const;
++  Instance* FingerprintInstance() const { return mParent; }
+ 
+   nsCString LabelOrId() const {
+     nsCString ret = this->CLabel();
+diff --git a/dom/webgpu/Instance.cpp b/dom/webgpu/Instance.cpp
+index d07fa7a..7783739 100644
+--- a/dom/webgpu/Instance.cpp
++++ b/dom/webgpu/Instance.cpp
+@@ -11,10 +11,15 @@
+ #include "ipc/WebGPUChild.h"
+ #include "ipc/WebGPUTypes.h"
+ #include "js/Value.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/StaticPrefs_dom.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/BrowsingContext.h"
++#include "mozilla/dom/Document.h"
++#include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/gfx/CanvasManagerChild.h"
+ #include "mozilla/gfx/Logging.h"
+@@ -22,6 +27,7 @@
+ #include "mozilla/webgpu/ffi/wgpu.h"
+ #include "nsDebug.h"
+ #include "nsIGlobalObject.h"
++#include "nsPIDOMWindow.h"
+ #include "nsString.h"
+ #include "nsStringFwd.h"
+ 
+@@ -88,6 +94,61 @@ Instance::Instance(nsIGlobalObject* aGlobal)
+   }
+ }
+ 
++nsString Instance::FingerprintProfile() const {
++  nsAutoString fingerprint;
++  if (NS_IsMainThread()) {
++    nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(mGlobal);
++    if (dom::Document* doc = window ? window->GetExtantDoc() : nullptr) {
++      if (dom::BrowsingContext* context = doc->GetBrowsingContext()) {
++        fingerprint = context->Top()->GetFingerprintProfile();
++      }
++    }
++  } else if (dom::WorkerPrivate* worker =
++                 dom::GetCurrentThreadWorkerPrivate()) {
++    fingerprint = worker->GetFingerprintProfile();
++  }
++  return fingerprint;
++}
++
++dom::GPUTextureFormat Instance::GetPreferredCanvasFormat() const {
++  nsString fingerprint = FingerprintProfile();
++  if (!fingerprint.IsEmpty()) {
++    dom::AutoJSAPI jsapi;
++    if (jsapi.Init(mGlobal)) {
++      JSContext* cx = jsapi.cx();
++      JS::Rooted<JS::Value> root(cx);
++      if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                       &root) &&
++          root.isObject()) {
++        JS::Rooted<JS::Value> webgpu(cx);
++        JS::Rooted<JS::Value> format(cx);
++        JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++        if (JS_GetProperty(cx, rootObject, "webGPU", &webgpu) &&
++            webgpu.isObject()) {
++          JS::Rooted<JSObject*> webgpuObject(cx, &webgpu.toObject());
++          if (!JS_GetProperty(cx, webgpuObject, "preferredCanvasFormat",
++                              &format) ||
++              !format.isString()) {
++            return kIsAndroid ? dom::GPUTextureFormat::Rgba8unorm
++                              : dom::GPUTextureFormat::Bgra8unorm;
++          }
++          nsAutoJSString value;
++          if (value.init(cx, format.toString())) {
++            if (value.EqualsLiteral("rgba8unorm"))
++              return dom::GPUTextureFormat::Rgba8unorm;
++            if (value.EqualsLiteral("bgra8unorm"))
++              return dom::GPUTextureFormat::Bgra8unorm;
++          }
++        }
++      } else {
++        JS_ClearPendingException(cx);
++      }
++    }
++  }
++  return kIsAndroid ? dom::GPUTextureFormat::Rgba8unorm
++                    : dom::GPUTextureFormat::Bgra8unorm;
++}
++
+ JSObject* Instance::WrapObject(JSContext* cx,
+                                JS::Handle<JSObject*> givenProto) {
+   return dom::GPU_Binding::Wrap(cx, this, givenProto);
+diff --git a/dom/webgpu/Instance.h b/dom/webgpu/Instance.h
+index ff229df..e4c88ed 100644
+--- a/dom/webgpu/Instance.h
++++ b/dom/webgpu/Instance.h
+@@ -65,15 +65,10 @@ class Instance final : public nsWrapperCache {
+   already_AddRefed<dom::Promise> RequestAdapter(
+       const dom::GPURequestAdapterOptions& aOptions, ErrorResult& aRv);
+ 
+-  dom::GPUTextureFormat GetPreferredCanvasFormat() const {
+-    // Changing implementation in a way that increases fingerprinting surface?
+-    // Please create a bug in [Core::Privacy: Anti
+-    // Tracking](https://bugzilla.mozilla.org/enter_bug.cgi?product=Core&component=Privacy%3A%20Anti-Tracking)
+-    if (kIsAndroid) {
+-      return dom::GPUTextureFormat::Rgba8unorm;
+-    }
+-    return dom::GPUTextureFormat::Bgra8unorm;
+-  };
++  dom::GPUTextureFormat GetPreferredCanvasFormat() const;
++
++  // BROWSER_FINGERPRINT: current window/worker profile. Empty means native.
++  nsString FingerprintProfile() const;
+ 
+  private:
+   explicit Instance(nsIGlobalObject* aGlobal);
+diff --git a/layout/style/FontFaceSet.cpp b/layout/style/FontFaceSet.cpp
+index 5f65b2a..b010b33 100644
+--- a/layout/style/FontFaceSet.cpp
++++ b/layout/style/FontFaceSet.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "FontFaceSet.h"
+ 
++#include "js/Array.h"
++#include "js/JSON.h"
++#include "js/PropertyAndElement.h"
+ #include "FontPreloader.h"
+ #include "ReferrerInfo.h"
+ #include "gfxFontConstants.h"
+@@ -25,6 +28,7 @@
+ #include "mozilla/Sprintf.h"
+ #include "mozilla/css/Loader.h"
+ #include "mozilla/dom/CSSFontFaceRule.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/DocumentInlines.h"
+ #include "mozilla/dom/Event.h"
+@@ -36,6 +40,8 @@
+ #include "mozilla/dom/FontFaceSetLoadEventBinding.h"
+ #include "mozilla/dom/FontFaceSetWorkerImpl.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/ScriptSettings.h"
++#include "mozilla/dom/WorkerPrivate.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsContentPolicyUtils.h"
+ #include "nsContentUtils.h"
+@@ -179,6 +185,76 @@ bool FontFaceSet::Check(const nsACString& aFont, const nsAString& aText,
+     }
+   }
+ 
++  // Author @font-face entries above keep their native loading semantics.
++  // For a pure system-font query, an optional per-context fontFamilies list
++  // defines which local families are visible. Missing key keeps Gecko native.
++  if (faces.IsEmpty()) {
++    nsAutoString fingerprint;
++    if (Document* doc = mImpl->GetDocument()) {
++      if (BrowsingContext* context = doc->GetBrowsingContext()) {
++        fingerprint = context->Top()->GetFingerprintProfile();
++      }
++    } else if (WorkerPrivate* worker = GetCurrentThreadWorkerPrivate()) {
++      fingerprint = worker->GetFingerprintProfile();
++    }
++    if (!fingerprint.IsEmpty()) {
++      AutoJSAPI jsapi;
++      if (jsapi.Init(GetParentObject())) {
++        JSContext* cx = jsapi.cx();
++        JS::Rooted<JS::Value> root(cx);
++        if (JS_ParseJSON(cx, fingerprint.BeginReading(), fingerprint.Length(),
++                         &root) &&
++            root.isObject()) {
++          JS::Rooted<JSObject*> rootObject(cx, &root.toObject());
++          JS::Rooted<JS::Value> familiesValue(cx);
++          if (JS_GetProperty(cx, rootObject, "fontFamilies",
++                             &familiesValue) &&
++              familiesValue.isObject()) {
++            JS::Rooted<JSObject*> familiesObject(
++                cx, &familiesValue.toObject());
++            bool isArray = false;
++            if (JS::IsArrayObject(cx, familiesObject, &isArray) && isArray) {
++              nsAutoCString query(aFont);
++              ToLowerCase(query);
++              uint32_t count = 0;
++              if (!JS::GetArrayLength(cx, familiesObject, &count)) {
++                JS_ClearPendingException(cx);
++                return false;
++              }
++              for (uint32_t i = 0; i < count; ++i) {
++                JS::Rooted<JS::Value> item(cx);
++                if (!JS_GetElement(cx, familiesObject, i, &item) ||
++                    !item.isString()) {
++                  continue;
++                }
++                nsAutoJSString family;
++                if (!family.init(cx, item.toString())) {
++                  continue;
++                }
++                nsAutoCString familyUtf8 = NS_ConvertUTF16toUTF8(family);
++                ToLowerCase(familyUtf8);
++                if (query.Find(familyUtf8) != kNotFound) {
++                  return true;
++                }
++              }
++              // Generic fallback names are browser primitives rather than
++              // enumerable local families.
++              if (query.Find("sans-serif") != kNotFound ||
++                  query.Find("serif") != kNotFound ||
++                  query.Find("monospace") != kNotFound ||
++                  query.Find("system-ui") != kNotFound) {
++                return true;
++              }
++              return false;
++            }
++          }
++        } else {
++          JS_ClearPendingException(cx);
++        }
++      }
++    }
++  }
++
+   return true;
+ }
+ 
+diff --git a/mozconfig b/tmp/firefox_p0_backup_download/mozconfig
+deleted file mode 100644
+index 6fdfcd4..0000000
+--- a/mozconfig
++++ /dev/null
+@@ -1,10 +0,0 @@
+-ac_add_options --enable-application=browser
+-ac_add_options --enable-optimize
+-ac_add_options --disable-debug
+-ac_add_options --enable-release
+-ac_add_options --enable-update-channel=release
+-ac_add_options --disable-warnings-as-errors
+-ac_add_options --without-wasm-sandboxed-libraries
+-ac_add_options --enable-bootstrap
+-export MOZILLA_OFFICIAL=1
+-mk_add_options MOZ_OBJDIR=D:/ff/obj-release

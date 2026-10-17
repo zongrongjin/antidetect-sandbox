@@ -1,0 +1,14 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# //BROWSER_FINGERPRINT: per-BrowserContext fingerprint profile domain.
+# This domain overrides the fingerprint profile applied to a BrowserContext.
+experimental domain Fingerprint
+  # Sets the fingerprint JSON blob for the current target's BrowserContext.
+  # Every page in that context (including targets created afterwards) inherits it
+  # via RendererPreferences propagation.
+  command setContextOverrides
+    parameters
+      # Opaque fingerprint profile (a JSON blob consumed by renderer read-points).
+      string fingerprint

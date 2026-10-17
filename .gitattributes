@@ -1,0 +1,8 @@
+* text=auto
+*.diff text eol=lf
+*.patch text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.pdl text eol=lf
+*.cc text eol=lf
+*.h text eol=lf

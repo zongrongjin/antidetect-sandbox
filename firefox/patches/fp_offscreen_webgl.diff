@@ -1,0 +1,16 @@
+# Window OffscreenCanvas WebGL was missing the fingerprint profile
+# (ClientWebGLContext::GetOwnerDoc() is null on a window OffscreenCanvas).
+# Masked LOCAL_GL_RENDERER must stay "Mozilla" (real Firefox); ANGLE belongs
+# on UNMASKED_RENDERER only. DataDome Firefox>91 reads the masked slot.
+#
+# Applied after patches/fp_all.diff via:
+#   python3 scripts/patch_offscreen_webgl.py $SRC/dom/canvas/ClientWebGLContext.cpp
+#
+# Do not git-apply this comment file. The Python patcher is the source of truth.
+#
+# Hunks (dom/canvas/ClientWebGLContext.cpp):
+# 1) #include "mozilla/dom/OffscreenCanvas.h"
+# 2) FpRbProfileGl(doc, OffscreenCanvas*) also walks aOffscreen->CopyFingerprintProfile
+# 3) fnFpWebgl uses FpRbProfileGl(GetOwnerDoc(), mOffscreenCanvas)
+# 4) LOCAL_GL_RENDERER: if fingerprint present, return "Mozilla" (not webglRenderer,
+#    not host llvmpipe). UNMASKED_* still consume webglVendor/webglRenderer.

@@ -1,0 +1,661 @@
+diff --git a/third_party/blink/renderer/core/css/font_face_set.cc b/third_party/blink/renderer/core/css/font_face_set.cc
+index 783e00a..c99ceb2 100644
+--- a/third_party/blink/renderer/core/css/font_face_set.cc
++++ b/third_party/blink/renderer/core/css/font_face_set.cc
+@@ -4,11 +4,17 @@
+ 
+ #include "third_party/blink/renderer/core/css/font_face_set.h"
+ 
++#include "base/json/json_reader.h"
++#include "base/values.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_font_face_set_load_status.h"
+ #include "third_party/blink/renderer/core/css/font_face_cache.h"
+ #include "third_party/blink/renderer/core/css/font_face_set_load_event.h"
++#include "third_party/blink/renderer/core/exported/web_view_impl.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
++#include "third_party/blink/renderer/core/workers/worker_global_scope.h"
+ #include "third_party/blink/renderer/platform/font_family_names.h"
+ #include "third_party/blink/renderer/platform/fonts/font.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+@@ -17,6 +23,46 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++std::optional<base::DictValue> FingerprintForFontContext(
++    ExecutionContext* context) {
++  std::string fingerprint;
++  if (auto* window = DynamicTo<LocalDOMWindow>(context)) {
++    if (LocalFrame* frame = window->GetFrame()) {
++      if (WebLocalFrameImpl* web_frame = WebLocalFrameImpl::FromFrame(frame);
++          web_frame && web_frame->ViewImpl()) {
++        fingerprint =
++            web_frame->ViewImpl()->GetRendererPreferences().fingerprint;
++      }
++    }
++  } else if (auto* worker = DynamicTo<WorkerGlobalScope>(context)) {
++    fingerprint = worker->Fingerprint().Utf8();
++  }
++  if (fingerprint.empty())
++    return std::nullopt;
++  std::optional<base::Value> root =
++      base::JSONReader::Read(fingerprint, base::JSON_PARSE_RFC);
++  if (!root || !root->is_dict())
++    return std::nullopt;
++  return std::move(root->GetDict());
++}
++
++bool FontFamilyIsInProfile(const base::ListValue& families,
++                           const AtomicString& family) {
++  for (const base::Value& value : families) {
++    const std::string* candidate = value.GetIfString();
++    if (candidate &&
++        EqualIgnoringAsciiCase(
++            String::FromUtf8(std::string_view(*candidate)), family)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ const int FontFaceSet::kDefaultFontSize = 10;
+ 
+ // static
+@@ -246,6 +292,10 @@ bool FontFaceSet::check(const String& font_string,
+ 
+   FontSelector* font_selector = GetFontSelector();
+   FontFaceCache* font_face_cache = font_selector->GetFontFaceCache();
++  std::optional<base::DictValue> fingerprint =
++      FingerprintForFontContext(GetExecutionContext());
++  const base::ListValue* fingerprint_families =
++      fingerprint ? fingerprint->FindList("fontFamilies") : nullptr;
+ 
+   unsigned index = 0;
+   while (index < text.length()) {
+@@ -254,6 +304,19 @@ bool FontFaceSet::check(const String& font_string,
+ 
+     for (const FontFamily* f = &font->GetFontDescription().Family(); f;
+          f = f->Next()) {
++      if (fingerprint_families && !f->FamilyIsGeneric()) {
++        CSSSegmentedFontFace* face =
++            font_face_cache->Get(font->GetFontDescription(), f->FamilyName());
++        if (!face) {
++          if (!FontFamilyIsInProfile(*fingerprint_families,
++                                     f->FamilyName())) {
++            return false;
++          }
++          // The profile explicitly exposes this system family. The actual
++          // fallback/alias is handled by the font selector/rendering path.
++          continue;
++        }
++      }
+       if (f->FamilyIsGeneric() || font_selector->IsPlatformFamilyMatchAvailable(
+                                       font->GetFontDescription(), *f)) {
+         continue;
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 891a815..4b0d725 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -27,6 +27,8 @@
+ 
+ #include <tuple>
+ 
++#include "base/json/json_reader.h"
++#include "base/values.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+@@ -36,6 +38,8 @@
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/deprecation/deprecation.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
++#include "third_party/blink/renderer/core/exported/web_view_impl.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/html/media/autoplay_policy.h"
+ #include "third_party/blink/renderer/core/timing/dom_window_performance.h"
+@@ -93,6 +97,57 @@ void SpeechSynthesis::OnSetVoiceList(
+ }
+ 
+ const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
++  std::string fingerprint;
++  if (LocalFrame* frame = GetSupplementable()->GetFrame()) {
++    if (WebLocalFrameImpl* web_frame = WebLocalFrameImpl::FromFrame(frame);
++        web_frame && web_frame->ViewImpl()) {
++      fingerprint =
++          web_frame->ViewImpl()->GetRendererPreferences().fingerprint;
++    }
++  }
++  std::optional<base::Value> root =
++      fingerprint.empty()
++          ? std::nullopt
++          : base::JSONReader::Read(fingerprint, base::JSON_PARSE_RFC);
++  const base::ListValue* profile_voices =
++      root && root->is_dict()
++          ? root->GetDict().FindList("speechVoices")
++          : nullptr;
++  if (profile_voices) {
++    String profile_key =
++        String::FromUtf8(std::string_view(fingerprint));
++    if (!has_fingerprint_voice_profile_ ||
++        profile_key != fingerprint_voice_profile_) {
++      fingerprint_voice_list_.clear();
++      for (const base::Value& value : *profile_voices) {
++        const base::DictValue* voice = value.GetIfDict();
++        if (!voice)
++          continue;
++        const std::string* name = voice->FindString("name");
++        const std::string* lang = voice->FindString("lang");
++        const std::string* uri = voice->FindString("voiceURI");
++        std::optional<bool> local = voice->FindBool("localService");
++        std::optional<bool> is_default = voice->FindBool("default");
++        if (!name || !lang || !uri || !local || !is_default)
++          continue;
++        auto mojom_voice = mojom::blink::SpeechSynthesisVoice::New();
++        mojom_voice->name = String::FromUtf8(std::string_view(*name));
++        mojom_voice->lang = String::FromUtf8(std::string_view(*lang));
++        mojom_voice->voice_uri = String::FromUtf8(std::string_view(*uri));
++        mojom_voice->is_local_service = *local;
++        mojom_voice->is_default = *is_default;
++        fingerprint_voice_list_.push_back(
++            MakeGarbageCollected<SpeechSynthesisVoice>(
++                std::move(mojom_voice)));
++      }
++      fingerprint_voice_profile_ = profile_key;
++      has_fingerprint_voice_profile_ = true;
++    }
++    return fingerprint_voice_list_;
++  }
++  has_fingerprint_voice_profile_ = false;
++  fingerprint_voice_profile_ = String();
++  fingerprint_voice_list_.clear();
+   // Kick off initialization here to ensure voice list gets populated.
+   std::ignore = TryEnsureMojomSynthesis();
+   return voice_list_;
+@@ -337,6 +392,7 @@ void SpeechSynthesis::Trace(Visitor* visitor) const {
+   visitor->Trace(receiver_);
+   visitor->Trace(mojom_synthesis_);
+   visitor->Trace(voice_list_);
++  visitor->Trace(fingerprint_voice_list_);
+   visitor->Trace(utterance_queue_);
+   Supplement<LocalDOMWindow>::Trace(visitor);
+   EventTarget::Trace(visitor);
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.h b/third_party/blink/renderer/modules/speech/speech_synthesis.h
+index 0199d00..905f81c 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.h
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.h
+@@ -133,6 +133,9 @@ class MODULES_EXPORT SpeechSynthesis final
+       receiver_;
+   HeapMojoRemote<mojom::blink::SpeechSynthesis> mojom_synthesis_;
+   HeapVector<Member<SpeechSynthesisVoice>> voice_list_;
++  HeapVector<Member<SpeechSynthesisVoice>> fingerprint_voice_list_;
++  String fingerprint_voice_profile_;
++  bool has_fingerprint_voice_profile_ = false;
+   HeapDeque<Member<SpeechSynthesisUtterance>> utterance_queue_;
+   bool is_paused_ = false;
+ 
+diff --git a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+index 51568c0..1ce8382 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+@@ -4782,6 +4782,10 @@ ScriptValue WebGL2RenderingContextBase::getParameter(ScriptState* script_state,
+                                                      GLenum pname) {
+   if (isContextLost())
+     return ScriptValue::CreateNull(script_state->GetIsolate());
++  if (std::optional<ScriptValue> fp_value =
++          FingerprintParameter(script_state, pname)) {
++    return *fp_value;
++  }
+   switch (pname) {
+     case GL_SHADING_LANGUAGE_VERSION: {
+       return WebGLAny(
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 611132e..5b3a996 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -47,6 +47,7 @@
+ #include "base/notimplemented.h"
+ #include "base/numerics/checked_math.h"
+ #include "base/strings/stringprintf.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/synchronization/lock.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/memory_dump_manager.h"
+@@ -4014,10 +4015,89 @@ Vector<String> FingerprintWebGLList(ExecutionContext* ec, const char* key) {
+ }
+ }  // namespace
+ 
++std::optional<ScriptValue>
++WebGLRenderingContextBase::FingerprintParameter(ScriptState* script_state,
++                                                GLenum pname) {
++  const char* profile_key =
++      IsWebGL2() ? "webgl2Parameters" : "webglParameters";
++  std::string fp = FpJsonForCtx(Host()->GetTopExecutionContext());
++  if (fp.empty())
++    return std::nullopt;
++  std::optional<base::Value> root =
++      base::JSONReader::Read(fp, base::JSON_PARSE_RFC);
++  if (!root || !root->is_dict())
++    return std::nullopt;
++  const base::DictValue* parameters =
++      root->GetDict().FindDict(profile_key);
++  if (!parameters)
++    return std::nullopt;
++  const base::DictValue* entry =
++      parameters->FindDict(base::NumberToString(pname));
++  if (!entry)
++    return std::nullopt;
++  const std::string* type = entry->FindString("type");
++  const base::Value* value = entry->Find("value");
++  if (!type || !value)
++    return std::nullopt;
++
++  if (*type == "bool") {
++    if (std::optional<bool> v = value->GetIfBool())
++      return WebGLAny(script_state, *v);
++  } else if (*type == "int") {
++    if (std::optional<int> v = value->GetIfInt())
++      return WebGLAny(script_state, *v);
++    if (std::optional<double> v = value->GetIfDouble())
++      return WebGLAny(script_state, static_cast<int>(*v));
++  } else if (*type == "uint") {
++    if (std::optional<int> v = value->GetIfInt(); v && *v >= 0)
++      return WebGLAny(script_state, static_cast<unsigned>(*v));
++  } else if (*type == "float") {
++    if (std::optional<double> v = value->GetIfDouble())
++      return WebGLAny(script_state, static_cast<float>(*v));
++    if (std::optional<int> v = value->GetIfInt())
++      return WebGLAny(script_state, static_cast<float>(*v));
++  } else if (*type == "string") {
++    if (const std::string* v = value->GetIfString())
++      return WebGLAny(
++          script_state, String::FromUtf8(std::string_view(*v)));
++  } else if (*type == "int32" || *type == "float32") {
++    const base::ListValue* list = value->GetIfList();
++    if (!list)
++      return std::nullopt;
++    if (*type == "int32") {
++      Vector<int> values;
++      for (const base::Value& item : *list) {
++        if (std::optional<int> v = item.GetIfInt()) {
++          values.push_back(*v);
++        } else {
++          return std::nullopt;
++        }
++      }
++      return WebGLAny(script_state, DOMInt32Array::Create(values));
++    }
++    Vector<float> values;
++    for (const base::Value& item : *list) {
++      if (std::optional<double> double_value = item.GetIfDouble()) {
++        values.push_back(static_cast<float>(*double_value));
++      } else if (std::optional<int> int_value = item.GetIfInt()) {
++        values.push_back(static_cast<float>(*int_value));
++      } else {
++        return std::nullopt;
++      }
++    }
++    return WebGLAny(script_state, DOMFloat32Array::Create(values));
++  }
++  return std::nullopt;
++}
++
+ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+                                                     GLenum pname) {
+   if (isContextLost())
+     return ScriptValue::CreateNull(script_state->GetIsolate());
++  if (std::optional<ScriptValue> fp_value =
++          FingerprintParameter(script_state, pname)) {
++    return *fp_value;
++  }
+   const int kIntZero = 0;
+   switch (pname) {
+     case GL_ACTIVE_TEXTURE:
+@@ -4541,6 +4621,33 @@ WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
+       return nullptr;
+   }
+ 
++  {
++    const char* profile_key =
++        IsWebGL2() ? "webgl2ShaderPrecision" : "webglShaderPrecision";
++    std::string fp = FpJsonForCtx(Host()->GetTopExecutionContext());
++    std::optional<base::Value> root =
++        fp.empty() ? std::nullopt
++                   : base::JSONReader::Read(fp, base::JSON_PARSE_RFC);
++    if (root && root->is_dict()) {
++      const base::DictValue* profile =
++          root->GetDict().FindDict(profile_key);
++      if (profile) {
++        std::string key = base::NumberToString(shader_type) + ":" +
++                          base::NumberToString(precision_type);
++        const base::ListValue* values = profile->FindList(key);
++        if (values && values->size() == 3) {
++          std::optional<int> range_min = (*values)[0].GetIfInt();
++          std::optional<int> range_max = (*values)[1].GetIfInt();
++          std::optional<int> precision = (*values)[2].GetIfInt();
++          if (range_min && range_max && precision) {
++            return MakeGarbageCollected<WebGLShaderPrecisionFormat>(
++                *range_min, *range_max, *precision);
++          }
++        }
++      }
++    }
++  }
++
+   GLint range[2] = {0, 0};
+   GLint precision = 0;
+   ContextGL()->GetShaderPrecisionFormat(shader_type, precision_type, range,
+@@ -4572,8 +4679,17 @@ WebGLRenderingContextBase::getSupportedExtensions() {
+   const char* fp_key = IsWebGL2() ? "webgl2Extensions" : "webglExtensions";
+   Vector<String> fp_ext =
+       FingerprintWebGLList(Host()->GetTopExecutionContext(), fp_key);
+-  if (!fp_ext.empty())
+-    return fp_ext;
++  if (!fp_ext.empty()) {
++    // Do not advertise an extension that this build cannot instantiate.
++    // Returning the intersection keeps getSupportedExtensions/getExtension
++    // and actual extension behavior consistent.
++    Vector<String> filtered;
++    for (const String& wanted : fp_ext) {
++      if (result.Contains(wanted))
++        filtered.push_back(wanted);
++    }
++    return filtered;
++  }
+ 
+   return result;
+ }
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
+index 6257ff0..d1dc342 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
+@@ -659,6 +659,11 @@ class MODULES_EXPORT WebGLRenderingContextBase
+       ::partition_alloc::internal::MaxDirectMapped();
+ 
+  protected:
++  // Returns a per-context capability value when the corresponding optional
++  // fingerprint JSON entry exists. Missing/malformed entries return nullopt
++  // and leave the native WebGL path untouched.
++  std::optional<ScriptValue> FingerprintParameter(ScriptState*, GLenum pname);
++
+   // Implementation helpers.
+   friend class ScopedPixelLocalStorageInterrupt;
+   friend class ScopedDrawingBufferBinder;
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu.cc b/third_party/blink/renderer/modules/webgpu/gpu.cc
+index 4aae58a..1a9f7bc 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "base/feature_list.h"
++#include "base/json/json_reader.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/notreached.h"
+ #include "base/synchronization/waitable_event.h"
+@@ -28,6 +29,9 @@
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/exported/web_view_impl.h"
++#include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
++#include "third_party/blink/renderer/core/workers/worker_global_scope.h"
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/modules/webgpu/dawn_enum_conversions.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter.h"
+@@ -405,7 +409,7 @@ ScriptPromise<IDLNullable<GPUAdapter>> GPU::requestAdapter(
+   // Remind developers when they are using WebGPU on unsupported platforms.
+   ExecutionContext* execution_context = GetExecutionContext();
+   if (execution_context &&
+-      !base::FeatureList::IsEnabled(features::kWebGPUService)) {
++      !base::FeatureList::IsEnabled(::features::kWebGPUService)) {
+     execution_context->AddConsoleMessage(MakeGarbageCollected<ConsoleMessage>(
+         mojom::blink::ConsoleMessageSource::kJavaScript,
+         mojom::blink::ConsoleMessageLevel::kInfo,
+@@ -423,9 +427,44 @@ ScriptPromise<IDLNullable<GPUAdapter>> GPU::requestAdapter(
+ }
+ 
+ V8GPUTextureFormat GPU::getPreferredCanvasFormat() {
++  if (std::optional<base::DictValue> profile = FingerprintWebGPU()) {
++    if (const std::string* format =
++            profile->FindString("preferredCanvasFormat")) {
++      if (*format == "rgba8unorm")
++        return V8GPUTextureFormat(V8GPUTextureFormat::Enum::kRgba8Unorm);
++      if (*format == "bgra8unorm")
++        return V8GPUTextureFormat(V8GPUTextureFormat::Enum::kBgra8Unorm);
++    }
++  }
+   return FromDawnEnum(GetPreferredCanvasFormat());
+ }
+ 
++std::optional<base::DictValue> GPU::FingerprintWebGPU() const {
++  std::string fingerprint;
++  ExecutionContext* context = GetExecutionContext();
++  if (auto* window = DynamicTo<LocalDOMWindow>(context)) {
++    if (LocalFrame* frame = window->GetFrame()) {
++      if (WebLocalFrameImpl* web_frame = WebLocalFrameImpl::FromFrame(frame);
++          web_frame && web_frame->ViewImpl()) {
++        fingerprint =
++            web_frame->ViewImpl()->GetRendererPreferences().fingerprint;
++      }
++    }
++  } else if (auto* worker = DynamicTo<WorkerGlobalScope>(context)) {
++    fingerprint = worker->Fingerprint().Utf8();
++  }
++  if (fingerprint.empty())
++    return std::nullopt;
++  std::optional<base::Value> root =
++      base::JSONReader::Read(fingerprint, base::JSON_PARSE_RFC);
++  if (!root || !root->is_dict())
++    return std::nullopt;
++  const base::DictValue* webgpu = root->GetDict().FindDict("webGPU");
++  if (!webgpu)
++    return std::nullopt;
++  return webgpu->Clone();
++}
++
+ wgpu::TextureFormat GPU::GetPreferredCanvasFormat() {
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_LINUX)
+   // Interop of vulkan and GL has mesa driver bugs for BGRA format
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu.h b/third_party/blink/renderer/modules/webgpu/gpu.h
+index 51b9fe0..2352cbb 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu.h
++++ b/third_party/blink/renderer/modules/webgpu/gpu.h
+@@ -6,6 +6,7 @@
+ #define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGPU_GPU_H_
+ 
+ #include "base/memory/scoped_refptr.h"
++#include "base/values.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+@@ -88,6 +89,10 @@ class MODULES_EXPORT GPU final : public ScriptWrappable,
+ 
+   static wgpu::TextureFormat GetPreferredCanvasFormat();
+ 
++  // BROWSER_FINGERPRINT: returns the optional per-context WebGPU profile.
++  // Missing/malformed JSON cleanly falls back to the native adapter.
++  std::optional<base::DictValue> FingerprintWebGPU() const;
++
+   // Store the buffer in a weak hash set so we can destroy it when the
+   // context is destroyed.
+   void TrackMappableBuffer(GPUBuffer* buffer);
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+index 4e4ca8d..ee2e2c1 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter.h"
+ 
++#include <algorithm>
++
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+@@ -30,7 +32,20 @@ namespace blink {
+ 
+ namespace {
+ 
+-GPUSupportedFeatures* MakeFeatureNameSet(wgpu::Adapter adapter) {
++bool ProfileContainsFeature(const base::ListValue* desired,
++                            const String& feature) {
++  if (!desired)
++    return true;
++  for (const base::Value& value : *desired) {
++    const std::string* name = value.GetIfString();
++    if (name && feature == String::FromUtf8(std::string_view(*name)))
++      return true;
++  }
++  return false;
++}
++
++GPUSupportedFeatures* MakeFeatureNameSet(wgpu::Adapter adapter,
++                                         const base::ListValue* desired) {
+   GPUSupportedFeatures* features = MakeGarbageCollected<GPUSupportedFeatures>();
+   DCHECK(features->FeatureNameSet().empty());
+ 
+@@ -43,13 +58,63 @@ GPUSupportedFeatures* MakeFeatureNameSet(wgpu::Adapter adapter) {
+     auto feature_name_enum_optional =
+         GPUSupportedFeatures::ToV8FeatureNameEnum(f);
+     if (feature_name_enum_optional) {
+-      features->AddFeatureName(
+-          V8GPUFeatureName(feature_name_enum_optional.value()));
+-      }
++      V8GPUFeatureName feature(feature_name_enum_optional.value());
++      if (ProfileContainsFeature(desired, feature.AsString()))
++        features->AddFeatureName(feature);
++    }
+   }
+   return features;
+ }
+ 
++void ApplyLimitProfile(const base::DictValue* profile,
++                       GPUSupportedLimits::ComboLimits& limits) {
++  if (!profile)
++    return;
++#define FP_MAX_LIMIT(name)                                      \
++  if (std::optional<int> value = profile->FindInt(#name);       \
++      value && *value >= 0) {                                   \
++    limits.name = std::min(limits.name,                          \
++                           static_cast<decltype(limits.name)>(*value)); \
++  }
++#define FP_MIN_LIMIT(name)                                      \
++  if (std::optional<int> value = profile->FindInt(#name);       \
++      value && *value >= 0) {                                   \
++    limits.name = std::max(limits.name,                          \
++                           static_cast<decltype(limits.name)>(*value)); \
++  }
++  FP_MAX_LIMIT(maxTextureDimension1D)
++  FP_MAX_LIMIT(maxTextureDimension2D)
++  FP_MAX_LIMIT(maxTextureDimension3D)
++  FP_MAX_LIMIT(maxTextureArrayLayers)
++  FP_MAX_LIMIT(maxBindGroups)
++  FP_MAX_LIMIT(maxBindingsPerBindGroup)
++  FP_MAX_LIMIT(maxDynamicUniformBuffersPerPipelineLayout)
++  FP_MAX_LIMIT(maxDynamicStorageBuffersPerPipelineLayout)
++  FP_MAX_LIMIT(maxSampledTexturesPerShaderStage)
++  FP_MAX_LIMIT(maxSamplersPerShaderStage)
++  FP_MAX_LIMIT(maxStorageBuffersPerShaderStage)
++  FP_MAX_LIMIT(maxStorageTexturesPerShaderStage)
++  FP_MAX_LIMIT(maxUniformBuffersPerShaderStage)
++  FP_MAX_LIMIT(maxUniformBufferBindingSize)
++  FP_MAX_LIMIT(maxStorageBufferBindingSize)
++  FP_MIN_LIMIT(minUniformBufferOffsetAlignment)
++  FP_MIN_LIMIT(minStorageBufferOffsetAlignment)
++  FP_MAX_LIMIT(maxVertexBuffers)
++  FP_MAX_LIMIT(maxBufferSize)
++  FP_MAX_LIMIT(maxVertexAttributes)
++  FP_MAX_LIMIT(maxVertexBufferArrayStride)
++  FP_MAX_LIMIT(maxInterStageShaderVariables)
++  FP_MAX_LIMIT(maxColorAttachments)
++  FP_MAX_LIMIT(maxComputeWorkgroupStorageSize)
++  FP_MAX_LIMIT(maxComputeInvocationsPerWorkgroup)
++  FP_MAX_LIMIT(maxComputeWorkgroupSizeX)
++  FP_MAX_LIMIT(maxComputeWorkgroupSizeY)
++  FP_MAX_LIMIT(maxComputeWorkgroupSizeZ)
++  FP_MAX_LIMIT(maxComputeWorkgroupsPerDimension)
++#undef FP_MIN_LIMIT
++#undef FP_MAX_LIMIT
++}
++
+ }  // anonymous namespace
+ 
+ GPUAdapter::GPUAdapter(
+@@ -113,10 +178,38 @@ GPUAdapter::GPUAdapter(
+   subgroup_max_size_ = info.subgroupMaxSize;
+   power_preference_ = powerProperties.powerPreference;
+ 
+-  features_ = MakeFeatureNameSet(GetHandle());
++  std::optional<base::DictValue> fingerprint = gpu_->FingerprintWebGPU();
++  const base::DictValue* adapter_profile =
++      fingerprint ? fingerprint->FindDict("adapter") : nullptr;
++  if (adapter_profile) {
++    auto override_string = [adapter_profile](const char* key, String& target) {
++      if (const std::string* value = adapter_profile->FindString(key))
++        target = String::FromUtf8(std::string_view(*value));
++    };
++    override_string("vendor", vendor_);
++    override_string("architecture", architecture_);
++    override_string("device", device_);
++    override_string("description", description_);
++    override_string("driver", driver_);
++    if (std::optional<int> value =
++            adapter_profile->FindInt("subgroupMinSize");
++        value && *value >= 0) {
++      subgroup_min_size_ = static_cast<uint32_t>(*value);
++    }
++    if (std::optional<int> value =
++            adapter_profile->FindInt("subgroupMaxSize");
++        value && *value >= 0) {
++      subgroup_max_size_ = static_cast<uint32_t>(*value);
++    }
++  }
++
++  features_ = MakeFeatureNameSet(
++      GetHandle(), fingerprint ? fingerprint->FindList("features") : nullptr);
+ 
+   GPUSupportedLimits::ComboLimits limits;
+   GetHandle().GetLimits(limits.GetLinked());
++  ApplyLimitProfile(
++      fingerprint ? fingerprint->FindDict("limits") : nullptr, limits);
+   limits_ = MakeGarbageCollected<GPUSupportedLimits>(limits);
+ 
+   info_ = CreateAdapterInfoForAdapter();
+@@ -124,6 +217,21 @@ GPUAdapter::GPUAdapter(
+ 
+ GPUAdapterInfo* GPUAdapter::CreateAdapterInfoForAdapter() {
+   bool is_fallback_adapter = adapter_type_ == wgpu::AdapterType::CPU;
++  String backend = FromDawnEnum(backend_type_);
++  String type = FromDawnEnum(adapter_type_);
++  if (std::optional<base::DictValue> fingerprint =
++          gpu_->FingerprintWebGPU()) {
++    if (const base::DictValue* adapter = fingerprint->FindDict("adapter")) {
++      if (std::optional<bool> value =
++              adapter->FindBool("isFallbackAdapter")) {
++        is_fallback_adapter = *value;
++      }
++      if (const std::string* value = adapter->FindString("backend"))
++        backend = String::FromUtf8(std::string_view(*value));
++      if (const std::string* value = adapter->FindString("type"))
++        type = String::FromUtf8(std::string_view(*value));
++    }
++  }
+ 
+   GPUAdapterInfo* info;
+   if (RuntimeEnabledFeatures::WebGPUDeveloperFeaturesEnabled()) {
+@@ -132,7 +240,7 @@ GPUAdapterInfo* GPUAdapter::CreateAdapterInfoForAdapter() {
+     info = MakeGarbageCollected<GPUAdapterInfo>(
+         vendor_, architecture_, subgroup_min_size_, subgroup_max_size_,
+         is_fallback_adapter, device_, description_, driver_,
+-        FromDawnEnum(backend_type_), FromDawnEnum(adapter_type_),
++        backend, type,
+         d3d_shader_model_, vk_driver_version_, FromDawnEnum(power_preference_));
+ 
+     // SAFETY: Required from caller
