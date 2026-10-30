@@ -38,6 +38,18 @@ experimental domain Context
       # Unix seconds. Omit for a session cookie.
       optional number expires
 
+  type CacheExplainRequest extends object
+    properties
+      string url
+      string method
+      optional string bodySha256
+
+  type CacheExplainResult extends object
+    properties
+      string url
+      string method
+      string action
+
   # Sets overrides for the current target's BrowserContext.
   # Omitted fields keep the previous value. All pages/workers in the context inherit.
   command setContextOverrides
@@ -53,6 +65,20 @@ experimental domain Context
       optional string url
       optional string html
 
+  # Current cache dir, rules JSON, and map JSON. Empty strings if unset.
+  command getCacheState
+    returns
+      string dir
+      string rules
+      string map
+
+  # Re-run MatchAction for URLs already in the Network log.
+  command explainCache
+    parameters
+      array of CacheExplainRequest requests
+    returns
+      array of CacheExplainResult results
+
   # Match-order events (captures > callbacks > HIT > blocks > allow-miss > observe > pass).
   event callback
     parameters
@@ -63,3 +89,11 @@ experimental domain Context
   event captured
     parameters
       string url
+
+  # Kernel cache verdict for one request. action is html, hit, store, block,
+  # allow-miss, observe, capture, callback, or pass.
+  event cacheDecision
+    parameters
+      string requestId
+      string url
+      string action

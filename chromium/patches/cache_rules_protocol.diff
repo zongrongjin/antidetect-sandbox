@@ -1,0 +1,12 @@
+﻿diff --git a/content/browser/devtools/protocol_config.json b/content/browser/devtools/protocol_config.json
+--- a/content/browser/devtools/protocol_config.json
++++ b/content/browser/devtools/protocol_config.json
+@@ -12,7 +12,8 @@
+             {
+                 "domain": "Context",
+-                "include": ["setContextOverrides"]
++                "include": ["setContextOverrides", "getCacheState", "explainCache", "cacheDecision"],
++                "async": ["setContextOverrides", "getCacheState", "explainCache"]
+             },
+             {
+                 "domain": "Audits",

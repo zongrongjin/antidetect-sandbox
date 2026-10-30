@@ -95,6 +95,61 @@ double NumberFrom(const base::DictValue* dict, const char* key, double fallback)
   return fallback;
 }
 
+struct UrlLimits {
+  double ttl = 0;
+  double max_entry = 10.0 * 1024 * 1024;
+  bool limit_status = false;
+  std::vector<int> statuses;
+};
+
+bool PatternHits(const std::string& url, const std::string& pat) {
+  return !pat.empty() && (pat == url || pat == "*" || base::MatchPattern(url, pat));
+}
+
+void ReadStatusList(const base::DictValue* dict, UrlLimits* limits) {
+  const base::ListValue* list = dict ? dict->FindList("cacheableStatus") : nullptr;
+  if (!list || list->empty())
+    return;
+  limits->limit_status = true;
+  for (const auto& item : *list) {
+    if (item.is_int())
+      limits->statuses.push_back(item.GetInt());
+    else if (item.is_double())
+      limits->statuses.push_back(static_cast<int>(item.GetDouble()));
+  }
+}
+
+UrlLimits LimitsFor(const std::string& url, const base::DictValue* rules) {
+  UrlLimits limits;
+  if (!rules)
+    return limits;
+  if (const base::ListValue* items = rules->FindList("items")) {
+    for (const auto& value : *items) {
+      const base::DictValue* item = value.GetIfDict();
+      if (!item)
+        continue;
+      const std::string* kind = item->FindString("kind");
+      if (!kind || *kind != "include")
+        continue;
+      if (std::optional<bool> enabled = item->FindBool("enabled");
+          enabled && !*enabled) {
+        continue;
+      }
+      const std::string* pattern = item->FindString("pattern");
+      if (!pattern || !PatternHits(url, *pattern))
+        continue;
+      limits.ttl = NumberFrom(item, "ttl", 0);
+      limits.max_entry = NumberFrom(item, "maxEntry", 10.0 * 1024 * 1024);
+      ReadStatusList(item, &limits);
+      return limits;
+    }
+  }
+  limits.ttl = NumberFrom(rules, "ttl", 0);
+  limits.max_entry = NumberFrom(rules, "maxEntry", 10.0 * 1024 * 1024);
+  ReadStatusList(rules, &limits);
+  return limits;
+}
+
 bool LooksLikeSha256Hex(const std::string& s) {
   if (s.size() != 64)
     return false;
@@ -160,8 +215,10 @@ bool CacheExcluded(const std::string& url, const base::DictValue* rules) {
   return MatchAny(url, ListFrom(rules, "exclude"));
 }
 
-bool EntryExpired(const base::DictValue* entry, const base::DictValue* rules) {
-  double ttl = NumberFrom(rules, "ttl", 0);
+bool EntryExpired(const base::DictValue* entry,
+                  const std::string& url,
+                  const base::DictValue* rules) {
+  double ttl = LimitsFor(url, rules).ttl;
   if (ttl <= 0 || !entry)
     return false;
   if (!entry->Find("created_at"))
@@ -180,7 +237,7 @@ std::string MatchAction(const std::string& url,
   if (MatchAny(url, ListFrom(rules, "callbacks")))
     return "callback";
   const base::DictValue* entry = FindHitEntry(index, cache_key);
-  if (entry && !CacheExcluded(url, rules) && !EntryExpired(entry, rules))
+  if (entry && !CacheExcluded(url, rules) && !EntryExpired(entry, url, rules))
     return "hit";
   if (MatchAny(url, ListFrom(rules, "blocks")))
     return "block";
@@ -205,6 +262,27 @@ void DispatchMatch(BrowserContext* bc,
       h->NotifyMatch(kind, url);
     }
   }
+}
+
+void DispatchCacheDecision(BrowserContext* bc,
+                           const std::string& request_id,
+                           const std::string& url,
+                           const std::string& action) {
+  if (!bc || action.empty())
+    return;
+  for (auto& host : DevToolsAgentHost::GetOrCreateAll()) {
+    if (host->GetBrowserContext() != bc)
+      continue;
+    auto* impl = static_cast<DevToolsAgentHostImpl*>(host.get());
+    for (auto* h : impl->HandlersByName<protocol::ContextHandler>(
+             protocol::Context::Metainfo::domainName)) {
+      h->NotifyCacheDecision(request_id, url, action);
+    }
+  }
+}
+
+std::string DevToolsRequestId(const network::ResourceRequest& request) {
+  return request.devtools_request_id.value_or(std::string());
 }
 
 bool SkipHeader(const std::string& name) {
@@ -370,16 +448,14 @@ std::string CacheKey(const std::string& method,
   return key;
 }
 
-bool StatusCacheable(int status, const base::DictValue* rules) {
-  if (!rules)
+bool StatusCacheable(int status,
+                     const std::string& url,
+                     const base::DictValue* rules) {
+  UrlLimits limits = LimitsFor(url, rules);
+  if (!limits.limit_status)
     return status >= 200 && status < 300;
-  const base::ListValue* list = rules->FindList("cacheableStatus");
-  if (!list)
-    return status >= 200 && status < 300;
-  for (const auto& item : *list) {
-    if (item.is_int() && item.GetInt() == status)
-      return true;
-    if (item.is_double() && static_cast<int>(item.GetDouble()) == status)
+  for (int code : limits.statuses) {
+    if (code == status)
       return true;
   }
   return false;
@@ -641,12 +717,16 @@ class PersistClient : public network::mojom::URLLoaderClient,
   PersistClient(BrowserContext* bc,
                 std::string dir,
                 std::string url,
+                std::string page_url,
+                std::string devtools_request_id,
                 base::DictValue rules,
                 scoped_refptr<base::SequencedTaskRunner> persist_runner,
                 mojo::PendingRemote<network::mojom::URLLoaderClient> downstream)
       : bc_(bc),
         dir_(std::move(dir)),
         url_(std::move(url)),
+        page_url_(std::move(page_url)),
+        devtools_request_id_(std::move(devtools_request_id)),
         rules_(std::move(rules)),
         persist_runner_(std::move(persist_runner)),
         downstream_(std::move(downstream)) {}
@@ -661,7 +741,7 @@ class PersistClient : public network::mojom::URLLoaderClient,
       network::mojom::URLResponseHeadPtr head,
       mojo::ScopedDataPipeConsumerHandle body,
       std::optional<mojo_base::BigBuffer> cached_metadata) override {
-    double max_entry = NumberFrom(&rules_, "maxEntry", 10 * 1024 * 1024);
+    double max_entry = LimitsFor(page_url_, &rules_).max_entry;
     if (head && head->content_length > 0 && max_entry > 0 &&
         static_cast<double>(head->content_length) > max_entry) {
       skip_persist_ = true;
@@ -760,10 +840,10 @@ class PersistClient : public network::mojom::URLLoaderClient,
       return;
     if (!complete_status_ || complete_status_->error_code != net::OK)
       return;
-    if (!StatusCacheable(status_, &rules_))
+    if (!StatusCacheable(status_, page_url_, &rules_))
       return;
     std::string persist_body = DecodePersistBody(body_, content_encoding_);
-    double max_entry = NumberFrom(&rules_, "maxEntry", 10 * 1024 * 1024);
+    double max_entry = LimitsFor(page_url_, &rules_).max_entry;
     if (max_entry > 0 &&
         static_cast<double>(persist_body.size()) > max_entry)
       return;
@@ -787,17 +867,30 @@ class PersistClient : public network::mojom::URLLoaderClient,
                        encoded_len),
         base::BindOnce(
             [](base::OnceCallback<void(std::string)> merge,
-               PersistWriteResult result) {
-              if (!result.ok || merge.is_null())
+               base::OnceClosure notify_store, PersistWriteResult result) {
+              if (!result.ok)
                 return;
-              std::move(merge).Run(std::move(result.map_json));
+              if (notify_store)
+                std::move(notify_store).Run();
+              if (!merge.is_null())
+                std::move(merge).Run(std::move(result.map_json));
             },
-            std::move(merge)));
+            std::move(merge),
+            CallbackIfContextCacheAlive(
+                bc_, base::BindOnce(
+                         [](BrowserContext* bc, std::string request_id,
+                            std::string page_url) {
+                           DispatchCacheDecision(bc, request_id, page_url,
+                                                 "store");
+                         },
+                         bc_.get(), devtools_request_id_, page_url_))));
   }
 
   raw_ptr<BrowserContext> bc_;
   std::string dir_;
   std::string url_;
+  std::string page_url_;
+  std::string devtools_request_id_;
   base::DictValue rules_;
   scoped_refptr<base::SequencedTaskRunner> persist_runner_;
   mojo::Remote<network::mojom::URLLoaderClient> downstream_;
@@ -839,6 +932,7 @@ class ContextMatchingURLLoaderFactory
     std::string doc_url, doc_html;
     if (bc_ && GetContextDocument(bc_, &doc_url, &doc_html) &&
         !doc_html.empty() && DocumentUrlMatch(url, doc_url)) {
+      DispatchCacheDecision(bc_, DevToolsRequestId(request), url, "html");
       BindIdleLoader(std::move(loader));
       FinishServeHit(url,
                      "HTTP/1.1 200 OK\nContent-Type: text/html; charset=utf-8\n\n",
@@ -865,6 +959,7 @@ class ContextMatchingURLLoaderFactory
         CacheKey(request.method, url, RequestBodyBytes(request));
     const std::string action = MatchAction(url, cache_key, rules, index);
     DispatchMatch(bc_, action, url);
+    DispatchCacheDecision(bc_, DevToolsRequestId(request), url, action);
     if (action == "hit") {
       const base::DictValue* entry = FindHitEntry(index, cache_key);
       BindIdleLoader(std::move(loader));
@@ -950,8 +1045,8 @@ class ContextMatchingURLLoaderFactory
         persist_remote.InitWithNewPipeAndPassReceiver();
     mojo::MakeSelfOwnedReceiver(
         std::make_unique<PersistClient>(
-            bc_, dir, cache_key, std::move(rules), persist_runner_,
-            std::move(client)),
+            bc_, dir, cache_key, request.url.spec(), DevToolsRequestId(request),
+            std::move(rules), persist_runner_, std::move(client)),
         std::move(persist_receiver));
     target_->CreateLoaderAndStart(std::move(loader), request_id, options,
                                   request, std::move(persist_remote),
@@ -966,6 +1061,42 @@ class ContextMatchingURLLoaderFactory
 
 }  // namespace
 
+std::string ExplainContextCache(BrowserContext* browser_context,
+                                const std::string& method,
+                                const std::string& url,
+                                const std::string& body_sha256) {
+  if (!browser_context)
+    return "pass";
+  std::string doc_url, doc_html;
+  if (GetContextDocument(browser_context, &doc_url, &doc_html) &&
+      !doc_html.empty() && DocumentUrlMatch(url, doc_url)) {
+    return "html";
+  }
+  std::string dir, map_json, rules_json;
+  if (!GetContextCache(browser_context, &dir, &map_json, &rules_json))
+    return "pass";
+  std::optional<base::DictValue> rules_v =
+      rules_json.empty()
+          ? std::nullopt
+          : base::JSONReader::ReadDict(rules_json, /*options=*/0);
+  std::optional<base::DictValue> map_v =
+      map_json.empty()
+          ? std::nullopt
+          : base::JSONReader::ReadDict(map_json, /*options=*/0);
+  const base::DictValue* rules = rules_v ? &*rules_v : nullptr;
+  const base::DictValue* index = map_v ? &*map_v : nullptr;
+  std::string m = base::ToUpperASCII(method);
+  std::string cache_key = url;
+  if (!m.empty() && m != "GET" && m != "HEAD") {
+    cache_key = m + " " + url;
+    if (!body_sha256.empty()) {
+      cache_key.push_back(' ');
+      cache_key.append(base::ToLowerASCII(body_sha256));
+    }
+  }
+  return MatchAction(url, cache_key, rules, index);
+}
+
 bool MaybeInstallContextRequestInterceptor(
     DevToolsAgentHostImpl* agent_host,
     StoragePartition* storage_partition,
@@ -975,6 +1106,7 @@ bool MaybeInstallContextRequestInterceptor(
   BrowserContext* bc = agent_host->GetBrowserContext();
   if (!bc)
     return false;
+  MaybeLoadContextCacheFile(bc);
   std::string dir, map, rules, doc_url, doc_html;
   if (!GetContextCache(bc, &dir, &map, &rules) &&
       !GetContextDocument(bc, &doc_url, &doc_html))

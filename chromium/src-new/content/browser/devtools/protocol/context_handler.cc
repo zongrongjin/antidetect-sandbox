@@ -3,6 +3,8 @@
 #include <utility>
 #include <vector>
 
+#include "content/browser/devtools/protocol/context_request_interceptor.h"
+
 #include "base/barrier_closure.h"
 #include "base/functional/bind.h"
 #include "base/time/time.h"
@@ -90,6 +92,55 @@ void ContextHandler::NotifyMatch(const std::string& kind,
     frontend_->Callback(url);
   else if (kind == "observe")
     frontend_->Observed(url);
+}
+
+void ContextHandler::NotifyCacheDecision(const std::string& request_id,
+                                         const std::string& url,
+                                         const std::string& action) {
+  if (!frontend_)
+    return;
+  frontend_->CacheDecision(request_id, url, action);
+}
+
+void ContextHandler::GetCacheState(
+    std::unique_ptr<GetCacheStateCallback> callback) {
+  auto* wc = GetWebContents();
+  if (!wc || !wc->GetBrowserContext()) {
+    callback->sendFailure(
+        DispatchResponse::ServerError("no BrowserContext"));
+    return;
+  }
+  std::string dir, map, rules;
+  GetContextCache(wc->GetBrowserContext(), &dir, &map, &rules);
+  callback->sendSuccess(dir, rules, map);
+}
+
+void ContextHandler::ExplainCache(
+    std::unique_ptr<protocol::Array<Context::CacheExplainRequest>> requests,
+    std::unique_ptr<ExplainCacheCallback> callback) {
+  auto* wc = GetWebContents();
+  if (!wc || !wc->GetBrowserContext()) {
+    callback->sendFailure(
+        DispatchResponse::ServerError("no BrowserContext"));
+    return;
+  }
+  BrowserContext* bc = wc->GetBrowserContext();
+  auto out = std::make_unique<protocol::Array<Context::CacheExplainResult>>();
+  if (requests) {
+    for (auto& item : *requests) {
+      if (!item)
+        continue;
+      const std::string url = item->GetUrl();
+      const std::string method = item->GetMethod();
+      const std::string sha = item->GetBodySha256("");
+      out->push_back(Context::CacheExplainResult::Create()
+                         .SetUrl(url)
+                         .SetMethod(method)
+                         .SetAction(ExplainContextCache(bc, method, url, sha))
+                         .Build());
+    }
+  }
+  callback->sendSuccess(std::move(out));
 }
 
 void ContextHandler::SetRenderer(int process_host_id,

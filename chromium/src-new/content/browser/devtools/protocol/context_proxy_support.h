@@ -29,6 +29,7 @@ bool GetContextProxy(BrowserContext* browser_context,
                      std::string* endpoint,
                      std::string* username,
                      std::string* password);
+void MaybeLoadContextCacheFile(BrowserContext* browser_context);
 void SetContextCache(BrowserContext* browser_context,
                      const std::string& dir,
                      const std::string& map,
@@ -46,6 +47,9 @@ void ScheduleContextCacheDiskLoad(BrowserContext* browser_context);
 // destruction (it becomes a no-op).
 base::OnceCallback<void(std::string)> BindContextCacheMapMerge(
     BrowserContext* browser_context);
+// Runs |task| later only while this context's cache data is still alive.
+base::OnceClosure CallbackIfContextCacheAlive(BrowserContext* browser_context,
+                                              base::OnceClosure task);
 void SetContextDocument(BrowserContext* browser_context,
                         const std::string& url,
                         const std::string& html);

@@ -1,6 +1,7 @@
 #include "content/browser/devtools/protocol/context_proxy_support.h"
 
 #include "base/base64.h"
+#include "base/command_line.h"
 #include "base/containers/flat_set.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
@@ -63,6 +64,7 @@ class ContextProxyUserData : public base::SupportsUserData::Data {
   std::string document_url;
   std::string document_html;
   bool cache_disk_load_started = false;
+  bool cache_file_checked = false;
   mojo::Remote<network::mojom::ProxyConfigClient> client;
   mojo::Remote<network::mojom::CustomProxyConfigClient> custom_client;
   base::WeakPtrFactory<ContextProxyUserData> weak_factory{this};
@@ -306,16 +308,89 @@ scoped_refptr<base::SequencedTaskRunner> ContextCachePersistRunner() {
   return *runner;
 }
 
+void WriteContextCacheProfile(BrowserContext* browser_context,
+                               const std::string& dir,
+                               const std::string& rules) {
+  if (!browser_context)
+    return;
+  base::FilePath profile = browser_context->GetPath();
+  if (profile.empty())
+    return;
+  base::DictValue out;
+  out.Set("dir", dir);
+  out.Set("rules", rules);
+  std::string json;
+  base::JSONWriter::Write(base::Value(out.Clone()), &json);
+  base::WriteFile(profile.AppendASCII("context_cache.json"), json);
+}
+
+void MaybeLoadContextCacheFile(BrowserContext* browser_context) {
+  if (!browser_context)
+    return;
+  auto* data = GetOrCreate(browser_context);
+  if (data->cache_file_checked)
+    return;
+  data->cache_file_checked = true;
+  if (!data->cache_dir.empty() || !data->cache_map.empty() ||
+      !data->cache_rules.empty())
+    return;
+  std::string text;
+  base::FilePath path;
+  const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
+  if (cmd->HasSwitch("context-cache-file")) {
+    path = base::FilePath::FromUTF8Unsafe(
+        cmd->GetSwitchValueASCII("context-cache-file"));
+  } else {
+    base::FilePath profile = browser_context->GetPath();
+    if (profile.empty())
+      return;
+    path = profile.AppendASCII("context_cache.json");
+  }
+  if (!base::ReadFileToString(path, &text) || text.empty())
+    return;
+  std::optional<base::DictValue> parsed =
+      base::JSONReader::ReadDict(text, /*options=*/0);
+  if (!parsed)
+    return;
+  const std::string* dir = parsed->FindString("dir");
+  std::string cache_dir = dir ? *dir : std::string();
+  std::string rules_json;
+  if (const std::string* rules = parsed->FindString("rules")) {
+    rules_json = *rules;
+  } else if (const base::DictValue* rules = parsed->FindDict("rules")) {
+    base::JSONWriter::Write(base::Value(rules->Clone()), &rules_json);
+  }
+  std::string map_json;
+  if (const std::string* map = parsed->FindString("map")) {
+    map_json = *map;
+  } else if (!cache_dir.empty()) {
+    base::ReadFileToString(
+        base::FilePath::FromUTF8Unsafe(cache_dir).AppendASCII("_map.json"),
+        &map_json);
+  }
+  SetContextCache(browser_context, cache_dir, map_json, rules_json);
+}
+
 void SetContextCache(BrowserContext* browser_context,
                      const std::string& dir,
                      const std::string& map,
                      const std::string& rules) {
   if (!browser_context)
     return;
+  std::string cache_dir = dir;
+  if (cache_dir.empty() && !rules.empty() && rules != "{}") {
+    base::FilePath profile = browser_context->GetPath();
+    if (!profile.empty()) {
+      base::FilePath automatic = profile.AppendASCII("ContextCache");
+      base::CreateDirectory(automatic);
+      cache_dir = automatic.AsUTF8Unsafe();
+    }
+  }
   auto* data = GetOrCreate(browser_context);
-  data->cache_dir = dir;
+  data->cache_dir = cache_dir;
   data->cache_rules = rules;
   MergeMapIntoData(data, map);
+  WriteContextCacheProfile(browser_context, cache_dir, rules);
 }
 
 void ScheduleContextCacheDiskLoad(BrowserContext* browser_context) {
@@ -360,6 +435,21 @@ base::OnceCallback<void(std::string)> BindContextCacheMapMerge(
         MergeMapIntoData(weak.get(), json);
       },
       std::move(weak));
+}
+
+base::OnceClosure CallbackIfContextCacheAlive(BrowserContext* browser_context,
+                                              base::OnceClosure task) {
+  if (!browser_context || !task)
+    return base::OnceClosure();
+  auto* data = GetOrCreate(browser_context);
+  auto weak = data->weak_factory.GetWeakPtr();
+  return base::BindOnce(
+      [](base::WeakPtr<ContextProxyUserData> weak, base::OnceClosure task) {
+        if (!weak || !task)
+          return;
+        std::move(task).Run();
+      },
+      std::move(weak), std::move(task));
 }
 
 bool GetContextCache(BrowserContext* browser_context,

@@ -38,7 +38,16 @@ class ContextHandler : public DevToolsDomainHandler, public Context::Backend {
       std::optional<String> html,
       std::unique_ptr<SetContextOverridesCallback> callback) override;
 
+  void GetCacheState(std::unique_ptr<GetCacheStateCallback> callback) override;
+
+  void ExplainCache(
+      std::unique_ptr<protocol::Array<Context::CacheExplainRequest>> requests,
+      std::unique_ptr<ExplainCacheCallback> callback) override;
+
   void NotifyMatch(const std::string& kind, const std::string& url);
+  void NotifyCacheDecision(const std::string& request_id,
+                           const std::string& url,
+                           const std::string& action);
 
  private:
   WebContentsImpl* GetWebContents();
