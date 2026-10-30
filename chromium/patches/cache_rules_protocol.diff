@@ -1,4 +1,4 @@
-﻿diff --git a/content/browser/devtools/protocol_config.json b/content/browser/devtools/protocol_config.json
+diff --git a/content/browser/devtools/protocol_config.json b/content/browser/devtools/protocol_config.json
 --- a/content/browser/devtools/protocol_config.json
 +++ b/content/browser/devtools/protocol_config.json
 @@ -12,7 +12,8 @@
