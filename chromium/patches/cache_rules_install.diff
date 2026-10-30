@@ -1,0 +1,35 @@
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -959,6 +959,10 @@ source_set("browser") {
+     "devtools/protocol/emulation_handler.cc",
+     "devtools/protocol/emulation_handler.h",
+     "devtools/protocol/context_handler.cc",
+     "devtools/protocol/context_handler.h",
++    "devtools/protocol/context_proxy_support.cc",
++    "devtools/protocol/context_proxy_support.h",
++    "devtools/protocol/context_request_interceptor.cc",
++    "devtools/protocol/context_request_interceptor.h",
+     "devtools/protocol/fedcm_handler.cc",
+     "devtools/protocol/fedcm_handler.h",
+diff --git a/content/browser/devtools/devtools_instrumentation.cc b/content/browser/devtools/devtools_instrumentation.cc
+--- a/content/browser/devtools/devtools_instrumentation.cc
++++ b/content/browser/devtools/devtools_instrumentation.cc
+@@ -21,6 +21,7 @@
+ #include "content/browser/devtools/protocol/audits.h"
+ #include "content/browser/devtools/protocol/audits_handler.h"
+ #include "content/browser/devtools/protocol/browser_handler.h"
++#include "content/browser/devtools/protocol/context_request_interceptor.h"
+ #include "content/browser/devtools/protocol/device_access_handler.h"
+ #include "content/browser/devtools/protocol/emulation_handler.h"
+ #include "content/browser/devtools/protocol/fedcm_handler.h"
+@@ -1796,7 +1797,9 @@ bool WillCreateURLLoaderFactoryParams::Run(
+     had_interceptors |= MaybeCreateProxyForInterception<protocol::FetchHandler>(
+         browser_agent_host, process_id_, storage_partition_, devtools_token_,
+         is_navigation, is_download, handler_override, header_client);
+   }
++  had_interceptors |= MaybeInstallContextRequestInterceptor(
++      agent_host_, storage_partition_, handler_override);
+   if (!had_interceptors) {
+     return false;
+   }

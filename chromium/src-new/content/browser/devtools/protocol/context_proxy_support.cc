@@ -321,8 +321,55 @@ void WriteContextCacheProfile(BrowserContext* browser_context,
   out.Set("rules", rules);
   std::string json;
   base::JSONWriter::Write(base::Value(out.Clone()), &json);
-  base::WriteFile(profile.AppendASCII("context_cache.json"), json);
+  // DevTools applies rules on the UI thread. File IO there trips
+  // AssertBlockingAllowed and kills the browser.
+  ContextCachePersistRunner()->PostTask(
+      FROM_HERE,
+      base::BindOnce(
+          [](base::FilePath path, std::string json) {
+            base::WriteFile(path, json);
+          },
+          profile.AppendASCII("context_cache.json"), std::move(json)));
 }
+
+struct LoadedContextCache {
+  bool ok = false;
+  std::string dir;
+  std::string rules;
+  std::string map;
+};
+
+LoadedContextCache ReadContextCacheFile(base::FilePath path) {
+  LoadedContextCache loaded;
+  std::string text;
+  if (!base::ReadFileToString(path, &text) || text.empty())
+    return loaded;
+  std::optional<base::DictValue> parsed =
+      base::JSONReader::ReadDict(text, /*options=*/0);
+  if (!parsed)
+    return loaded;
+  const std::string* dir = parsed->FindString("dir");
+  loaded.dir = dir ? *dir : std::string();
+  if (const std::string* rules = parsed->FindString("rules")) {
+    loaded.rules = *rules;
+  } else if (const base::DictValue* rules_dict = parsed->FindDict("rules")) {
+    base::JSONWriter::Write(base::Value(rules_dict->Clone()), &loaded.rules);
+  }
+  if (const std::string* map = parsed->FindString("map")) {
+    loaded.map = *map;
+  } else if (!loaded.dir.empty()) {
+    base::ReadFileToString(
+        base::FilePath::FromUTF8Unsafe(loaded.dir).AppendASCII("_map.json"),
+        &loaded.map);
+  }
+  loaded.ok = true;
+  return loaded;
+}
+
+void SetContextCache(BrowserContext* browser_context,
+                     const std::string& dir,
+                     const std::string& map,
+                     const std::string& rules);
 
 void MaybeLoadContextCacheFile(BrowserContext* browser_context) {
   if (!browser_context)
@@ -334,7 +381,6 @@ void MaybeLoadContextCacheFile(BrowserContext* browser_context) {
   if (!data->cache_dir.empty() || !data->cache_map.empty() ||
       !data->cache_rules.empty())
     return;
-  std::string text;
   base::FilePath path;
   const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
   if (cmd->HasSwitch("context-cache-file")) {
@@ -346,29 +392,18 @@ void MaybeLoadContextCacheFile(BrowserContext* browser_context) {
       return;
     path = profile.AppendASCII("context_cache.json");
   }
-  if (!base::ReadFileToString(path, &text) || text.empty())
-    return;
-  std::optional<base::DictValue> parsed =
-      base::JSONReader::ReadDict(text, /*options=*/0);
-  if (!parsed)
-    return;
-  const std::string* dir = parsed->FindString("dir");
-  std::string cache_dir = dir ? *dir : std::string();
-  std::string rules_json;
-  if (const std::string* rules = parsed->FindString("rules")) {
-    rules_json = *rules;
-  } else if (const base::DictValue* rules = parsed->FindDict("rules")) {
-    base::JSONWriter::Write(base::Value(rules->Clone()), &rules_json);
-  }
-  std::string map_json;
-  if (const std::string* map = parsed->FindString("map")) {
-    map_json = *map;
-  } else if (!cache_dir.empty()) {
-    base::ReadFileToString(
-        base::FilePath::FromUTF8Unsafe(cache_dir).AppendASCII("_map.json"),
-        &map_json);
-  }
-  SetContextCache(browser_context, cache_dir, map_json, rules_json);
+  auto weak = data->weak_factory.GetWeakPtr();
+  ContextCachePersistRunner()->PostTaskAndReplyWithResult(
+      FROM_HERE, base::BindOnce(&ReadContextCacheFile, path),
+      base::BindOnce(
+          [](base::WeakPtr<ContextProxyUserData> weak,
+             BrowserContext* browser_context, LoadedContextCache loaded) {
+            if (!weak || !loaded.ok)
+              return;
+            SetContextCache(browser_context, loaded.dir, loaded.map,
+                            loaded.rules);
+          },
+          std::move(weak), browser_context));
 }
 
 void SetContextCache(BrowserContext* browser_context,
@@ -382,7 +417,11 @@ void SetContextCache(BrowserContext* browser_context,
     base::FilePath profile = browser_context->GetPath();
     if (!profile.empty()) {
       base::FilePath automatic = profile.AppendASCII("ContextCache");
-      base::CreateDirectory(automatic);
+      ContextCachePersistRunner()->PostTask(
+          FROM_HERE,
+          base::BindOnce(
+              [](base::FilePath path) { base::CreateDirectory(path); },
+              automatic));
       cache_dir = automatic.AsUTF8Unsafe();
     }
   }

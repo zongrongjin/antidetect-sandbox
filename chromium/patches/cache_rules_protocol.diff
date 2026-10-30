@@ -10,3 +10,4 @@ diff --git a/content/browser/devtools/protocol_config.json b/content/browser/dev
              },
              {
                  "domain": "Audits",
+                 "include": ["enable", "disable"]

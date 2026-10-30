@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent.parent
 SRC_NEW = HERE / "src-new"
 
 REPLACEMENTS = [
+    ("protocol/fingerprint_handler.cc", "protocol/context_handler.cc"),
     ("protocol/fingerprint_handler.h", "protocol/context_handler.h"),
     ("protocol/fingerprint.cc", "protocol/context.cc"),
     ("protocol/fingerprint.h", "protocol/context.h"),
@@ -107,7 +108,14 @@ def main():
     if old_pdl.exists():
         old_pdl.unlink()
 
-    for name in ("context_handler.cc", "context_handler.h"):
+    for name in (
+        "context_handler.cc",
+        "context_handler.h",
+        "context_proxy_support.cc",
+        "context_proxy_support.h",
+        "context_request_interceptor.cc",
+        "context_request_interceptor.h",
+    ):
         shutil.copy2(
             SRC_NEW / "content/browser/devtools/protocol" / name,
             src / "content/browser/devtools/protocol" / name,

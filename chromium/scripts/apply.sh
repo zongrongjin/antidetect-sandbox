@@ -36,6 +36,18 @@ cp -v "$HERE/src-new/third_party/blink/public/devtools_protocol/domains/Fingerpr
 echo ">>> Context 域（Fingerprint 改名 + proxy 并入）"
 python3 "$HERE/scripts/patch_context_domain.py" "$SRC"
 
+echo ">>> cache rules（改名之后套，BUILD.gn 里已经是 context_handler）"
+git apply --check --ignore-whitespace "$HERE/patches/cache_rules_install.diff"
+git apply --ignore-whitespace "$HERE/patches/cache_rules_install.diff"
+git apply --check --ignore-whitespace "$HERE/patches/cache_rules_protocol.diff"
+git apply --ignore-whitespace "$HERE/patches/cache_rules_protocol.diff"
+if [ -d "$SRC/third_party/devtools-frontend/src/.git" ]; then
+  git -C "$SRC/third_party/devtools-frontend/src" apply --check --ignore-whitespace \
+    "$HERE/patches/cache_rules_devtools.diff"
+  git -C "$SRC/third_party/devtools-frontend/src" apply --ignore-whitespace \
+    "$HERE/patches/cache_rules_devtools.diff"
+fi
+
 if [ ! -d "$SRC_RTC/.git" ]; then
   echo "!! 找不到 $SRC_RTC/.git —— gclient sync 是否已完成？"
   exit 1
@@ -48,6 +60,7 @@ git apply --ignore-whitespace "$DIFF_RTC"
 cd "$SRC"
 
 echo ">>> 完成："
-echo "    chromium/src        fp_full.diff（相对 fdadfe85 的完整工作区，含 android surface / formFactors / layout）"
+echo "    chromium/src        fp_full.diff，然后 cache_rules_install.diff / cache_rules_protocol.diff"
+echo "    devtools-frontend    cache_rules_devtools.diff"
 echo "    third_party/webrtc   fp_webrtc.diff"
 echo "    接着跑 scripts/build.sh"

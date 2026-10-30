@@ -40,7 +40,10 @@ Latest：https://github.com/zongrongjin/antidetect-sandbox/releases/latest
 ## 仓库结构
 
 ```
-patches/fp_full.diff      # chromium/src 最终完整补丁（构建只应用这一份）
+patches/fp_full.diff      # 指纹补丁。先套这份，再跑 patch_context_domain.py
+patches/cache_rules_install.diff      # 改名之后：把缓存源文件编进 BUILD.gn，并挂上拦截器
+patches/cache_rules_protocol.diff     # Context 域补上 getCacheState / explainCache / cacheDecision
+patches/cache_rules_devtools.diff     # devtools-frontend 的网络面板缓存规则表单
 patches/fp_p0_capabilities.diff       # P0 阶段差异，仅作审计
 patches/fp_consistency_followup.diff  # 一致性阶段差异，仅作审计
 patches/fp_webrtc.diff    # third_party/webrtc 补丁：4 个改动文件（DEPS 独立仓库，需单独套）
