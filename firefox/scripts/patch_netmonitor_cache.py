@@ -147,6 +147,220 @@ const CacheRulesPanel = createFactory(
       CacheRulesPanel({ connector }),""",
         "panel mount",
     )
+    replace_once(
+        src / "devtools/shared/network-observer/NetworkObserver.sys.mjs",
+        """      const httpActivity = this.#createOrGetActivityObject(channel);
+      this.#createNetworkEvent(httpActivity);
+
+      // Handle overrides in http-on-before-connect because we need to redirect
+      // the request to the override before reaching the server.
+""",
+        """      const httpActivity = this.#createOrGetActivityObject(channel);
+      // A context-cache hit replaces the response and never notifies
+      // http-on-examine-response. NetworkResponseListener emits the status
+      // only when the activity is marked overridden.
+      if (readContextCacheAction(channel) === "hit") {
+        httpActivity.isOverridden = true;
+        httpActivity.fromCache = false;
+      }
+      this.#createNetworkEvent(httpActivity);
+
+      // Handle overrides in http-on-before-connect because we need to redirect
+      // the request to the override before reaching the server.
+""",
+        "hit row",
+    )
+    observer = src / "devtools/shared/network-observer/NetworkObserver.sys.mjs"
+    observer_text = observer.read_text(encoding="utf-8")
+    observer_helper = """
+function readContextCacheAction(channel) {
+  try {
+    return channel
+      .QueryInterface(Ci.nsIPropertyBag2)
+      .getPropertyAsAString("moz-context-cache-action");
+  } catch (e) {
+    return "";
+  }
+}
+"""
+    if "function readContextCacheAction" not in observer_text:
+        observer.write_text(observer_helper + observer_text, encoding="utf-8")
+        print("== patched hit helper")
+    else:
+        print("== already hit helper")
+
+    replace_once(
+        src / "devtools/server/actors/network-monitor/network-event-actor.js",
+        """      timings: {},
+      url,
+    };
+""",
+        """      timings: {},
+      url,
+      contextCacheAction: readContextCacheAction(channel),
+    };
+""",
+        "initial color",
+    )
+    replace_once(
+        src / "devtools/server/actors/network-monitor/network-event-actor.js",
+        """    const { responseStatus, responseStatusText } = channel;
+
+    this._isRedirect = lazy.NetworkUtils.isRedirect(responseStatus);
+    fromCache = fromCache || lazy.NetworkUtils.isFromCache(channel);
+""",
+        """    let responseStatus = 0;
+    let responseStatusText = "";
+    try {
+      responseStatus = channel.responseStatus;
+      responseStatusText = channel.responseStatusText;
+    } catch (e) {}
+
+    this._isRedirect = lazy.NetworkUtils.isRedirect(responseStatus);
+    // nsIReplacedHttpResponse pumps through mCachePump, so necko reports the
+    // channel as cached. A context-cache hit must stay a normal 200.
+    const contextCacheAction = readContextCacheAction(channel);
+    if (contextCacheAction === "hit" || contextCacheAction === "html") {
+      fromCache = false;
+    } else {
+      fromCache = fromCache || lazy.NetworkUtils.isFromCache(channel);
+    }
+""",
+        "hit status",
+    )
+    replace_once(
+        src / "devtools/server/actors/network-monitor/network-event-actor.js",
+        """    let waitingTime = null;
+    if (!isDataOrFile) {
+      const timedChannel = channel.QueryInterface(Ci.nsITimedChannel);
+      waitingTime = Math.round(
+        (timedChannel.responseStartTime - timedChannel.requestStartTime) / 1000
+      );
+    }
+""",
+        """    let waitingTime = null;
+    if (!isDataOrFile) {
+      try {
+        const timedChannel = channel.QueryInterface(Ci.nsITimedChannel);
+        waitingTime = Math.round(
+          (timedChannel.responseStartTime - timedChannel.requestStartTime) / 1000
+        );
+      } catch (e) {}
+    }
+""",
+        "hit timing",
+    )
+    replace_once(
+        src / "devtools/server/actors/network-monitor/network-event-actor.js",
+        """      httpVersion: isDataOrFile
+        ? null
+        : lazy.NetworkUtils.getHttpVersion(channel),
+      mimeType,
+      remoteAddress: fromCache ? "" : channel.remoteAddress,
+      remotePort: fromCache ? "" : channel.remotePort,
+""",
+        """      httpVersion: isDataOrFile ? null : safeHttpVersion(channel),
+      mimeType,
+      remoteAddress: fromCache ? "" : safeChannelField(channel, "remoteAddress"),
+      remotePort: fromCache ? "" : safeChannelField(channel, "remotePort"),
+""",
+        "hit remote",
+    )
+    replace_once(
+        src / "devtools/server/actors/network-monitor/network-event-actor.js",
+        "      isResolvedByTRR: channel.isResolvedByTRR,\n",
+        "      isResolvedByTRR: safeChannelField(channel, \"isResolvedByTRR\") || false,\n",
+        "hit trr",
+    )
+    actor = src / "devtools/server/actors/network-monitor/network-event-actor.js"
+    actor_text = actor.read_text(encoding="utf-8")
+    safe_helpers = """
+function safeChannelField(channel, name) {
+  try {
+    const value = channel[name];
+    return value == null ? "" : value;
+  } catch (e) {
+    return "";
+  }
+}
+
+function safeHttpVersion(channel) {
+  try {
+    return lazy.NetworkUtils.getHttpVersion(channel);
+  } catch (e) {
+    return "";
+  }
+}
+"""
+    if "function safeChannelField" not in actor_text:
+        actor.write_text(safe_helpers + actor_text, encoding="utf-8")
+        print("== patched hit field helpers")
+    else:
+        print("== already hit field helpers")
+
+    replace_once(
+        src / "devtools/server/actors/resources/network-events.js",
+        "        resourceUpdates.isRedirect = updateResource.isRedirect;\n",
+        """        resourceUpdates.isRedirect = updateResource.isRedirect;
+        if (updateResource.contextCacheAction) {
+          resourceUpdates.contextCacheAction = updateResource.contextCacheAction;
+        }
+""",
+        "color update",
+    )
+    replace_once(
+        src / "devtools/server/actors/resources/network-events.js",
+        """      case NETWORK_EVENT_TYPES.RESPONSE_CONTENT:
+        if (updateResource.contentSize !== undefined) {
+          resourceUpdates.contentSize = updateResource.contentSize;
+        }
+        resourceUpdates.transferredSize = updateResource.transferredSize;
+        resourceUpdates.mimeType = updateResource.mimeType;
+        break;
+""",
+        """      case NETWORK_EVENT_TYPES.RESPONSE_CONTENT:
+        if (updateResource.contentSize !== undefined) {
+          resourceUpdates.contentSize = updateResource.contentSize;
+        }
+        resourceUpdates.transferredSize = updateResource.transferredSize;
+        resourceUpdates.mimeType = updateResource.mimeType;
+        if (updateResource.contextCacheAction) {
+          resourceUpdates.contextCacheAction = updateResource.contextCacheAction;
+        }
+        break;
+""",
+        "color on body",
+    )
+    replace_once(
+        src / "devtools/server/actors/network-monitor/network-event-actor.js",
+        """        mimeType: content.mimeType,
+        contentSize: content.size,
+        transferredSize: content.transferredSize,
+        blockedReason,
+        extension,
+""",
+        """        mimeType: content.mimeType,
+        contentSize: content.size,
+        transferredSize: content.transferredSize,
+        blockedReason,
+        extension,
+        contextCacheAction: content.contextCacheAction || "",
+""",
+        "content color",
+    )
+    replace_once(
+        src / "devtools/shared/network-observer/NetworkResponseListener.sys.mjs",
+        """    this.#httpActivity.owner.addResponseContent(response);
+""",
+        """    try {
+      response.contextCacheAction = this.#httpActivity.channel
+        .QueryInterface(Ci.nsIPropertyBag2)
+        .getPropertyAsAString("moz-context-cache-action");
+    } catch (e) {}
+    this.#httpActivity.owner.addResponseContent(response);
+""",
+        "read color at body",
+    )
     print("== netmonitor cache rules patched ==")
     return 0
 

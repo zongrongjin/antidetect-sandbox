@@ -516,9 +516,15 @@ function onModifyRequest(subject) {
     markChannel(channel, action);
   }
   if (action === "hit") {
-    // Leave the channel alone here. DevTools creates the Network row in
-    // http-on-before-connect. The cached body is applied there.
+    // Leave the body alone here. DevTools creates the Network row in
+    // http-on-before-connect, and the cached body is applied there.
+    // Bypass Firefox's own HTTP cache so a refresh is not swallowed as a
+    // disk-cache entry before that notification.
     markChannel(channel, "hit");
+    try {
+      channel.loadFlags |=
+        Ci.nsIRequest.LOAD_BYPASS_CACHE | Ci.nsIRequest.INHIBIT_CACHING;
+    } catch (e) {}
     return;
   }
   if (action === "block") {
