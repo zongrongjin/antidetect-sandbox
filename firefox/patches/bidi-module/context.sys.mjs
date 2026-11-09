@@ -516,20 +516,9 @@ function onModifyRequest(subject) {
     markChannel(channel, action);
   }
   if (action === "hit") {
+    // Leave the channel alone here. DevTools creates the Network row in
+    // http-on-before-connect. The cached body is applied there.
     markChannel(channel, "hit");
-    const entry = findHitEntry(st.map, key);
-    if (!entry) {
-      return;
-    }
-    let body = "";
-    if (st.dir && entry.file) {
-      const p = entry.file.startsWith("/")
-        ? entry.file
-        : st.dir.replace(/\/+$/, "") + "/" + entry.file;
-      body = readFileSync(p);
-    }
-    const status = Number(entry.status) || 200;
-    serveOverride(channel, status, "OK", entry.headers || {}, body);
     return;
   }
   if (action === "block") {
@@ -590,7 +579,12 @@ function shouldPersist(method, url, dir, action, rules) {
   if (m !== "GET" && m !== "POST") {
     return false;
   }
-  if (action === "capture" || action === "callback" || action === "block") {
+  if (
+    action === "capture" ||
+    action === "callback" ||
+    action === "block" ||
+    action === "hit"
+  ) {
     return false;
   }
   if (action === "allow-miss") {
@@ -704,6 +698,50 @@ function persistResponse(channel, st, url, method, action) {
       fos.close();
     } catch (e2) {}
   }
+}
+
+function replayHit(channel, st, url, key) {
+  const entry = findHitEntry(st.map, key);
+  if (!entry) {
+    return false;
+  }
+  markChannel(channel, "hit");
+  let body = "";
+  if (st.dir && entry.file) {
+    const p = entry.file.startsWith("/")
+      ? entry.file
+      : st.dir.replace(/\/+$/, "") + "/" + entry.file;
+    body = readFileSync(p);
+  }
+  const status = Number(entry.status) || 200;
+  serveOverride(channel, status, "OK", entry.headers || {}, body);
+  return true;
+}
+
+function onBeforeConnect(subject) {
+  let channel;
+  try {
+    channel = subject.QueryInterface(Ci.nsIHttpChannel);
+  } catch (e) {
+    return;
+  }
+  const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
+  const st = stateFor(uid);
+  if (!st) {
+    return;
+  }
+  let url;
+  try {
+    url = channel.URI.spec;
+  } catch (e) {
+    return;
+  }
+  const method = channel.requestMethod;
+  const key = cacheKey(method, url, readUploadBody(channel));
+  if (matchAction(url, key, st.rules, st.map) !== "hit") {
+    return;
+  }
+  replayHit(channel, st, url, key);
 }
 
 function onExamineResponse(subject) {
@@ -859,6 +897,7 @@ function ensureNetHook() {
   gNetHooked = true;
   const obs = Services.obs;
   obs.addObserver(onModifyRequest, "http-on-modify-request");
+  obs.addObserver(onBeforeConnect, "http-on-before-connect");
   obs.addObserver(onExamineResponse, "http-on-examine-response");
   obs.addObserver(onExamineResponse, "http-on-examine-cached-response");
 }
