@@ -140,7 +140,7 @@ value、WebGPU/media 嵌套结构，以及“内核直接消费 / BC-only / 原�
 `canvasBlobReplay` 不做（Firefox 自身 canvas 加噪 + `readbackSeed` 已覆盖 toBlob）。
 `headersList` 不做（Firefox 请求头本身就是发出顺序）。
 
-`cache` / `url`+`html` / `cookies` 与 Chromium `Context.setContextOverrides` 对齐：HIT 与内存假首页走 `nsIReplacedHttpResponse`（HTTP/1.1，不发网）。BiDi `input.performActions` 保持 widget 路径（`isTrusted=true`）；页面 JS `dispatchEvent`/`new Event` 不改，仍按真 Firefox 为 `false`。
+`cache` / `url`+`html` / `cookies` 与 Chromium `Context.setContextOverrides` 对齐：HIT 与内存假首页走 `nsIReplacedHttpResponse`（HTTP/1.1，不发网）。`rules.items` 里第一条打中的启用 include 提供这一次的 `ttl`、`maxEntry`（缺省 10MB，0 为不限制）和 `cacheableStatus`（空为所有 2xx）。`ttl` 小于等于 0 表示不过期。`cache.dir` 为空且规则非空时，写入当前配置目录的 `context-cache/<userContextId>`。Network 面板有缓存规则侧栏；请求名按命中绿色、写入琥珀色、拦截红色上色，状态码列不变。DevTools 要在请求前打开。BiDi `input.performActions` 保持 widget 路径（`isTrusted=true`）；页面 JS `dispatchEvent`/`new Event` 不改，仍按真 Firefox 为 `false`。
 
 ### 配套：per-context 上游代理
 

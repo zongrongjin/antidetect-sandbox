@@ -37,6 +37,11 @@ if [ -f "$HERE/scripts/patch_context_module.py" ]; then
   python3 "$HERE/scripts/patch_context_module.py" "$SRC"
 fi
 
+if [ -f "$HERE/scripts/patch_netmonitor_cache.py" ]; then
+  echo "== Network cache rules panel =="
+  python3 "$HERE/scripts/patch_netmonitor_cache.py" "$SRC"
+fi
+
 if [ -f "$HERE/scripts/patch_input_trusted.py" ]; then
   echo "== BiDi input isTrusted (widget; page JS untouched) =="
   python3 "$HERE/scripts/patch_input_trusted.py" "$SRC"

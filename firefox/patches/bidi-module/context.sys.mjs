@@ -138,6 +138,94 @@ function listFrom(rules, key) {
   return rules[key].filter(x => typeof x === "string");
 }
 
+function patternHits(url, pat) {
+  if (!pat) {
+    return false;
+  }
+  if (pat === url || pat === "*") {
+    return true;
+  }
+  try {
+    return globToRe(pat).test(url);
+  } catch (e) {
+    return url.includes(pat);
+  }
+}
+
+function numFrom(obj, key, fallback) {
+  if (!obj || obj[key] == null || obj[key] === "") {
+    return fallback;
+  }
+  const n = Number(obj[key]);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function readStatuses(obj) {
+  const list = obj && obj.cacheableStatus;
+  if (!Array.isArray(list) || !list.length) {
+    return null;
+  }
+  const out = [];
+  for (const item of list) {
+    const n = Number(item);
+    if (Number.isFinite(n)) {
+      out.push(n);
+    }
+  }
+  return out.length ? out : null;
+}
+
+// First enabled include item whose pattern hits supplies the limits.
+// Otherwise the shared fields on rules are used.
+function limitsFor(url, rules) {
+  const limits = {
+    ttl: 0,
+    maxEntry: 10 * 1024 * 1024,
+    statuses: null,
+  };
+  if (!rules) {
+    return limits;
+  }
+  const items = Array.isArray(rules.items) ? rules.items : [];
+  for (const item of items) {
+    if (!item || item.kind !== "include" || item.enabled === false) {
+      continue;
+    }
+    if (!patternHits(url, item.pattern)) {
+      continue;
+    }
+    limits.ttl = numFrom(item, "ttl", 0);
+    limits.maxEntry = numFrom(item, "maxEntry", 10 * 1024 * 1024);
+    limits.statuses = readStatuses(item);
+    return limits;
+  }
+  limits.ttl = numFrom(rules, "ttl", 0);
+  limits.maxEntry = numFrom(rules, "maxEntry", 10 * 1024 * 1024);
+  limits.statuses = readStatuses(rules);
+  return limits;
+}
+
+function rulesActive(rules) {
+  if (!rules || typeof rules !== "object") {
+    return false;
+  }
+  for (const key of [
+    "include",
+    "exclude",
+    "captures",
+    "callbacks",
+    "blocks",
+    "allowMiss",
+    "observe",
+    "items",
+  ]) {
+    if (Array.isArray(rules[key]) && rules[key].length) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function looksLikeSha256Hex(s) {
   return typeof s === "string" && /^[0-9a-fA-F]{64}$/.test(s);
 }
@@ -217,8 +305,8 @@ function cacheExcluded(url, rules) {
   return matchAny(url, listFrom(rules, "exclude"));
 }
 
-function entryExpired(entry, rules) {
-  const ttl = rules && Number(rules.ttl) ? Number(rules.ttl) : 0;
+function entryExpired(entry, url, rules) {
+  const ttl = limitsFor(url, rules).ttl;
   if (ttl <= 0 || !entry || entry.created_at == null) {
     return false;
   }
@@ -233,7 +321,7 @@ function matchAction(url, cacheKey, rules, index) {
     return "callback";
   }
   const entry = findHitEntry(index, cacheKey);
-  if (entry && !cacheExcluded(url, rules) && !entryExpired(entry, rules)) {
+  if (entry && !cacheExcluded(url, rules) && !entryExpired(entry, url, rules)) {
     return "hit";
   }
   if (matchAny(url, listFrom(rules, "blocks"))) {
@@ -392,7 +480,7 @@ function onModifyRequest(subject) {
     return;
   }
   const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
-  const st = gNetByUserContext.get(uid);
+  const st = stateFor(uid);
   if (!st) {
     return;
   }
@@ -403,6 +491,7 @@ function onModifyRequest(subject) {
     return;
   }
   if (st.docHtml && documentUrlMatch(url, st.docUrl)) {
+    markChannel(channel, "html");
     serveOverride(
       channel,
       200,
@@ -422,7 +511,16 @@ function onModifyRequest(subject) {
   } else if (action === "capture") {
     emitNet("capture", url);
   }
+  if (
+    action === "callback" ||
+    action === "observe" ||
+    action === "capture" ||
+    action === "allow-miss"
+  ) {
+    markChannel(channel, action);
+  }
   if (action === "hit") {
+    markChannel(channel, "hit");
     const entry = findHitEntry(st.map, key);
     if (!entry) {
       return;
@@ -439,12 +537,24 @@ function onModifyRequest(subject) {
     return;
   }
   if (action === "block") {
+    markChannel(channel, "block");
     try {
       channel.cancel(Cr.NS_BINDING_ABORTED);
     } catch (e) {
       serveOverride(channel, 403, "Forbidden", {}, "");
     }
   }
+}
+
+function markChannel(channel, action) {
+  if (!action || action === "pass") {
+    return;
+  }
+  try {
+    channel
+      .QueryInterface(Ci.nsIWritablePropertyBag2)
+      .setPropertyAsAString("moz-context-cache-action", action);
+  } catch (e) {}
 }
 
 function readFileSync(path) {
@@ -468,9 +578,10 @@ function readFileSync(path) {
   }
 }
 
-function statusCacheable(status, rules) {
-  if (rules && Array.isArray(rules.cacheableStatus) && rules.cacheableStatus.length) {
-    return rules.cacheableStatus.includes(status);
+function statusCacheable(status, rules, url) {
+  const statuses = limitsFor(url, rules).statuses;
+  if (statuses && statuses.length) {
+    return statuses.includes(status);
   }
   return status >= 200 && status < 300;
 }
@@ -519,9 +630,20 @@ function persistResponse(channel, st, url, method, action) {
   } catch (e) {
     return;
   }
-  if (!statusCacheable(status, st.rules)) {
+  if (!statusCacheable(status, st.rules, url)) {
     return;
   }
+  const maxEntry = limitsFor(url, st.rules).maxEntry;
+  if (maxEntry > 0) {
+    let len = 0;
+    try {
+      len = Number(channel.getResponseHeader("content-length"));
+    } catch (e) {}
+    if (len > maxEntry) {
+      return;
+    }
+  }
+  markChannel(channel, "store");
   let trace;
   try {
     trace = channel.QueryInterface(Ci.nsITraceableChannel);
@@ -596,7 +718,7 @@ function onExamineResponse(subject) {
     return;
   }
   const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
-  const st = gNetByUserContext.get(uid);
+  const st = stateFor(uid);
   if (!st || !st.dir) {
     return;
   }
@@ -610,6 +732,127 @@ function onExamineResponse(subject) {
   const key = cacheKey(method, url, "");
   const action = matchAction(url, key, st.rules, st.map);
   persistResponse(channel, st, url, method, action);
+}
+
+function cacheRoot() {
+  const root = Services.dirsvc.get("ProfD", Ci.nsIFile);
+  root.append("context-cache");
+  return root;
+}
+
+function ensureContextDir(uid) {
+  const root = cacheRoot();
+  if (!root.exists()) {
+    root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+  }
+  const dir = root.clone();
+  dir.append(String(uid));
+  if (!dir.exists()) {
+    dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+  }
+  return dir.path;
+}
+
+function rulesFile(uid) {
+  const dir = cacheRoot();
+  dir.append(String(uid));
+  dir.append("context_cache.json");
+  return dir;
+}
+
+function writeFileSync(path, text) {
+  const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+  file.initWithPath(path);
+  const os = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(
+    Ci.nsIFileOutputStream
+  );
+  os.init(file, 0x02 | 0x08 | 0x20, 0o644, 0);
+  const cos = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(
+    Ci.nsIConverterOutputStream
+  );
+  cos.init(os, "UTF-8", 0, 0);
+  cos.writeString(text == null ? "" : String(text));
+  cos.close();
+}
+
+function loadMapSync(dir) {
+  if (!dir) {
+    return {};
+  }
+  return parseJsonObject(
+    readFileSync(dir.replace(/\/+$/, "") + "/_map.json"),
+    {}
+  );
+}
+
+function loadSaved(uid) {
+  const file = rulesFile(uid);
+  if (!file.exists()) {
+    return null;
+  }
+  const saved = parseJsonObject(readFileSync(file.path), null);
+  if (!saved) {
+    return null;
+  }
+  const rules = parseJsonObject(saved.rules, {});
+  const dir = saved.dir || "";
+  return {
+    dir,
+    map: loadMapSync(dir),
+    rules,
+    docUrl: "",
+    docHtml: "",
+  };
+}
+
+function writeSaved(uid, dir, rules) {
+  const file = rulesFile(uid);
+  try {
+    if (!file.parent.exists()) {
+      file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+    }
+  } catch (e) {}
+  writeFileSync(file.path, JSON.stringify({ dir: dir || "", rules: rules || {} }));
+}
+
+function stateFor(uid) {
+  if (gNetByUserContext.has(uid)) {
+    return gNetByUserContext.get(uid);
+  }
+  const loaded = loadSaved(uid);
+  if (!loaded) {
+    return null;
+  }
+  gNetByUserContext.set(uid, loaded);
+  ensureNetHook();
+  return loaded;
+}
+
+export function readContextNet(uid) {
+  const st = stateFor(uid);
+  if (!st) {
+    return { dir: "", rules: {}, map: {} };
+  }
+  return { dir: st.dir || "", rules: st.rules || {}, map: st.map || {} };
+}
+
+export function writeContextNet(uid, cache) {
+  ensureNetHook();
+  const rules = parseJsonObject(
+    cache && cache.rules,
+    cache && cache.rules && typeof cache.rules === "object" ? cache.rules : {}
+  );
+  let dir = (cache && cache.dir) || "";
+  if (!dir && rulesActive(rules)) {
+    dir = ensureContextDir(uid);
+  }
+  const st = netState(uid);
+  st.dir = dir;
+  st.rules = rules;
+  const overlay = parseJsonObject(cache && cache.map, {});
+  st.map = Object.assign({}, loadMapSync(dir), st.map, overlay);
+  writeSaved(uid, dir, rules);
+  return readContextNet(uid);
 }
 
 let gNetHooked = false;
@@ -833,15 +1076,19 @@ class ContextModule extends RootBiDiModule {
         throw new TypeError("Expected cache to be an object");
       }
       ensureNetHook();
-      const dir = cache.dir ?? "";
       const overlay = parseJsonObject(cache.map, {});
       const rules = parseJsonObject(cache.rules, {});
       for (const uid of netIds) {
-        const disk = dir ? await loadDiskMap(dir) : {};
+        let dir = cache.dir ?? "";
+        if (!dir && rulesActive(rules)) {
+          dir = ensureContextDir(uid);
+        }
+        const disk = dir ? loadMapSync(dir) : {};
         const st = netState(uid);
         st.dir = dir;
         st.map = Object.assign({}, disk, overlay);
         st.rules = rules;
+        writeSaved(uid, dir, rules);
       }
     }
 
@@ -965,3 +1212,5 @@ class ContextModule extends RootBiDiModule {
 }
 
 export const context = ContextModule;
+
+ensureNetHook();
