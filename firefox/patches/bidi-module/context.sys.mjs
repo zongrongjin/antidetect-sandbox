@@ -337,11 +337,7 @@ function matchAction(url, cacheKey, rules, index) {
 }
 
 function sha256hex(str) {
-  const converter = Cc[
-    "@mozilla.org/intl/scriptableunicodeconverter"
-  ].createInstance(Ci.nsIScriptableUnicodeConverter);
-  converter.charset = "UTF-8";
-  const data = converter.convertToByteArray(str);
+  const data = new TextEncoder().encode(str);
   const hasher = Cc["@mozilla.org/security/hash;1"].createInstance(
     Ci.nsICryptoHash
   );
