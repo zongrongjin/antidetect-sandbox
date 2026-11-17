@@ -8,11 +8,13 @@
 
 ## 补丁
 
-三个补丁都相对上面的基线，用 `git apply`：
+Chromium 三个补丁相对基线 `fdadfe85`，用 `git apply`：
 
 - `chromium.patch`：打在 Chromium 源码根目录。含新增的 `context_handler`、`context_proxy_support`、`context_request_interceptor` 和 `Context.pdl`。
 - `devtools-frontend.patch`：打在 `third_party/devtools-frontend/src`。
 - `webrtc.patch`：打在 `third_party/webrtc`。
+
+`firefox.patch` 相对官方 Firefox 152.0.5 源码包，在解压后的 `firefox-152.0.5` 目录里 `git apply`。里面是第一版指纹、Context、WebRTC，加上 Linux 上已经改好的缓存，以及 Windows 缓存路径按 `\` 拼接。补丁在那棵官方基线上做过 `git apply --reverse --check`。
 
 ## 这台机器上的回归
 
