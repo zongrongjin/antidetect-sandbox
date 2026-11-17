@@ -2,6 +2,8 @@
 
 基线 `fdadfe85a4cf993308b77a9324bd31b79df69ba3`。这版包含第一次 release 的指纹、Context、WebRTC，第二次 release 的缓存规则，以及两条代理都生效的改法：`Context.setContextOverrides.proxy` 和 `Target.createBrowserContext` 的 `proxyServer`（地址只用 `http://host:port`，账号不要写进 URL）。
 
+缓存规则的 `include` 为空时不进缓存，也不命中旧条目。要全站缓存，写一条 `*`。
+
 产物是 Windows 组件构建，`chrome.exe` 在 `out/Default`。发布包见本仓库的 Release，不进 git。没有替换 Linux 上正在给服务用的浏览器。
 
 ## 补丁

@@ -1179,10 +1179,10 @@ index 0000000000..408d553c94
 +#endif
 diff --git a/content/browser/devtools/protocol/context_request_interceptor.cc b/content/browser/devtools/protocol/context_request_interceptor.cc
 new file mode 100644
-index 0000000000..35187adc6f
+index 0000000000..74055e5725
 --- /dev/null
 +++ b/content/browser/devtools/protocol/context_request_interceptor.cc
-@@ -0,0 +1,1130 @@
+@@ -0,0 +1,1132 @@
 +#include "content/browser/devtools/protocol/context_request_interceptor.h"
 +
 +#include <algorithm>
@@ -1395,7 +1395,9 @@ index 0000000000..35187adc6f
 +
 +bool CacheExcluded(const std::string& url, const base::DictValue* rules) {
 +  std::vector<std::string> include = ListFrom(rules, "include");
-+  if (!include.empty() && !MatchAny(url, include))
++  // An empty include list is not a wildcard. Nothing is stored or hit
++  // unless a pattern matches. Use "*" to cache every URL.
++  if (include.empty() || !MatchAny(url, include))
 +    return true;
 +  return MatchAny(url, ListFrom(rules, "exclude"));
 +}
