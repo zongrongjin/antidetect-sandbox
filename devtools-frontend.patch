@@ -85,10 +85,10 @@ index 3f78dab6..2fedbb2e 100644
      "NetworkDataGridNode.ts",
 diff --git a/front_end/panels/network/CacheRulesView.ts b/front_end/panels/network/CacheRulesView.ts
 new file mode 100644
-index 00000000..4760141d
+index 00000000..3e5e5c73
 --- /dev/null
 +++ b/front_end/panels/network/CacheRulesView.ts
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,580 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -101,21 +101,17 @@ index 00000000..4760141d
 +import cacheRulesViewStyles from './cacheRulesView.css.js';
 +import type {NetworkLogView} from './NetworkLogView.js';
 +
-+const PATTERN_KEYS = [
-+  'include',
-+  'exclude',
-+  'captures',
-+  'callbacks',
-+  'blocks',
-+  'allowMiss',
-+  'observe',
-+] as const;
++const DEFAULT_MAX_ENTRY = 10 * 1024 * 1024;
++type RuleKind = 'include'|'exclude';
 +
-+type PatternKey = typeof PATTERN_KEYS[number];
-+
-+interface RowWidgets {
-+  enabled: HTMLInputElement;
-+  text: HTMLTextAreaElement;
++interface RuleItem {
++  id: string;
++  pattern: string;
++  kind: RuleKind;
++  enabled: boolean;
++  ttl: number;
++  maxEntry: number;
++  cacheableStatus: number[];
 +}
 +
 +interface ContextAgent {
@@ -132,33 +128,35 @@ index 00000000..4760141d
 +  invoke_setContextOverrides(params: object): Promise<{getError?: () => string | undefined}>;
 +}
 +
-+const ACTION_CLASS: Record<string, string> = {
-+  hit: 'zz-cache-hit',
-+  html: 'zz-cache-html',
-+  store: 'zz-cache-store',
-+  block: 'zz-cache-block',
-+  'allow-miss': 'zz-cache-allow-miss',
-+  observe: 'zz-cache-observe',
-+  capture: 'zz-cache-capture',
-+  callback: 'zz-cache-callback',
-+};
++const EXTRA_KEYS = ['captures', 'callbacks', 'blocks', 'allowMiss', 'observe'];
 +
 +export class CacheRulesView extends UI.Widget.VBox implements SDK.TargetManager.Observer {
 +  readonly #logView: NetworkLogView;
-+  readonly #rows = new Map<PatternKey, RowWidgets>();
++  readonly #list: HTMLElement;
++  readonly #empty: HTMLElement;
++  readonly #selectAll: HTMLInputElement;
++  readonly #deleteSelected: HTMLButtonElement;
++  readonly #mask: HTMLElement;
++  readonly #pattern: HTMLTextAreaElement;
++  readonly #kind: HTMLSelectElement;
 +  readonly #ttl: HTMLInputElement;
 +  readonly #maxEntry: HTMLInputElement;
-+  readonly #status: HTMLInputElement;
++  readonly #statuses: HTMLInputElement;
++  readonly #limitError: HTMLElement;
 +  readonly #error: HTMLElement;
 +  readonly #dispatcher = {
 +    cacheDecision: (params: {requestId?: string, url?: string, action?: string}): void => {
 +      this.#onDecision(params.requestId || '', params.url || '', params.action || '');
 +    },
 +  };
++  #rules: RuleItem[] = [];
++  #dir = '';
++  #map = '{}';
++  #extra: Record<string, unknown> = {};
 +  #pendingById = new Map<string, string>();
 +  #pendingByUrl = new Map<string, string>();
 +  #listening = false;
-+  #baseRules: Record<string, unknown> = {};
++  #loaded = false;
 +
 +  constructor(logView: NetworkLogView) {
 +    super();
@@ -166,49 +164,79 @@ index 00000000..4760141d
 +    this.element.classList.add('zz-cache-rules');
 +    this.registerRequiredCSS(cacheRulesViewStyles);
 +
-+    const title = this.element.createChild('div', 'zz-cache-title');
-+    title.textContent = '缓存规则';
++    const bar = this.element.createChild('div', 'zz-cache-bar');
++    const add = bar.createChild('button', 'zz-cache-add') as HTMLButtonElement;
++    add.textContent = '+ 新建规则';
++    add.addEventListener('click', () => this.#openDialog());
 +
-+    const legend = this.element.createChild('div', 'zz-cache-legend');
-+    legend.appendChild(this.#swatch('zz-cache-hit', '命中'));
-+    legend.appendChild(this.#swatch('zz-cache-store', '写入'));
-+    legend.appendChild(this.#swatch('zz-cache-block', '拦截'));
-+    legend.appendChild(this.#swatch('zz-cache-observe', '观察'));
-+    legend.appendChild(this.#swatch('zz-cache-capture', '捕获'));
-+    legend.appendChild(this.#swatch('zz-cache-allow-miss', '放行未命中'));
-+
-+    const hint = this.element.createChild('div', 'zz-cache-hint');
-+    hint.textContent = '一行一个匹配，支持 * 和 ?。勾选才启用。未勾选的键会从规则里去掉。';
-+
-+    for (const key of PATTERN_KEYS) {
-+      const row = this.element.createChild('label', 'zz-cache-row');
-+      const head = row.createChild('div', 'zz-cache-row-head');
-+      const box = head.createChild('input') as HTMLInputElement;
-+      box.type = 'checkbox';
-+      const name = head.createChild('span');
-+      name.textContent = key;
-+      const text = row.createChild('textarea') as HTMLTextAreaElement;
-+      text.rows = 2;
-+      text.spellcheck = false;
-+      text.placeholder = key === 'include' ? '*  或  https://example.com/*' : 'https://example.com/path*';
-+      this.#rows.set(key, {enabled: box, text});
-+    }
-+
-+    this.#ttl = this.#numberRow('ttl 秒，0 为不过期');
-+    this.#maxEntry = this.#numberRow('maxEntry 字节');
-+    this.#status = this.#numberRow('cacheableStatus，逗号分隔');
-+    this.#status.placeholder = '200';
++    const tools = this.element.createChild('div', 'zz-cache-tools');
++    const selectLabel = tools.createChild('label', 'zz-cache-check');
++    this.#selectAll = selectLabel.createChild('input') as HTMLInputElement;
++    this.#selectAll.type = 'checkbox';
++    selectLabel.appendChild(document.createTextNode('全选规则'));
++    this.#selectAll.addEventListener('change', () => {
++      void this.#toggleAll(this.#selectAll.checked);
++    });
++    this.#deleteSelected = tools.createChild('button', 'zz-cache-danger') as HTMLButtonElement;
++    this.#deleteSelected.textContent = '删除规则';
++    this.#deleteSelected.addEventListener('click', () => {
++      void this.#deleteChecked();
++    });
++    const exportButton = tools.createChild('button') as HTMLButtonElement;
++    exportButton.textContent = '导出';
++    exportButton.addEventListener('click', () => this.#export());
++    const importButton = tools.createChild('button') as HTMLButtonElement;
++    importButton.textContent = '导入';
++    const file = tools.createChild('input') as HTMLInputElement;
++    file.type = 'file';
++    file.accept = 'application/json,.json';
++    file.classList.add('zz-cache-file');
++    importButton.addEventListener('click', () => file.click());
++    file.addEventListener('change', () => {
++      const picked = file.files && file.files[0];
++      file.value = '';
++      if (picked) {
++        void this.#import(picked);
++      }
++    });
 +
 +    this.#error = this.element.createChild('div', 'zz-cache-error');
++    this.#empty = this.element.createChild('div', 'zz-cache-empty');
++    this.#empty.textContent = '还没有规则';
++    this.#list = this.element.createChild('div', 'zz-cache-list');
 +
-+    const buttons = this.element.createChild('div', 'zz-cache-buttons');
-+    const apply = buttons.createChild('button');
-+    apply.textContent = '应用';
-+    apply.addEventListener('click', () => void this.#apply());
-+    const cancel = buttons.createChild('button');
++    this.#mask = this.element.createChild('div', 'zz-cache-mask');
++    const dialog = this.#mask.createChild('div', 'zz-cache-dialog');
++    const title = dialog.createChild('div', 'zz-cache-dialog-title');
++    title.textContent = '新建规则';
++    const row = dialog.createChild('div', 'zz-cache-dialog-row');
++    this.#pattern = row.createChild('textarea') as HTMLTextAreaElement;
++    this.#pattern.placeholder = '例如 *.js';
++    this.#kind = row.createChild('select') as HTMLSelectElement;
++    for (const value of ['include', 'exclude'] as const) {
++      const option = this.#kind.createChild('option') as HTMLOptionElement;
++      option.value = value;
++      option.textContent = value;
++    }
++    const limits = dialog.createChild('div', 'zz-cache-limits');
++    this.#ttl = this.#limitInput(limits, 'ttl 秒，0 为不过期', '0');
++    this.#maxEntry = this.#limitInput(limits, 'maxEntry 字节，默认 10MB，0 为不限制', String(DEFAULT_MAX_ENTRY));
++    this.#statuses = this.#limitInput(limits, 'cacheableStatus，逗号分隔。空着表示所有 2xx', '200');
++    this.#limitError = limits.createChild('div', 'zz-cache-error');
++    const actions = dialog.createChild('div', 'zz-cache-dialog-actions');
++    const cancel = actions.createChild('button') as HTMLButtonElement;
++    cancel.type = 'button';
 +    cancel.textContent = '取消';
 +    cancel.addEventListener('click', () => this.cancel());
++    const submit = actions.createChild('button', 'zz-cache-add') as HTMLButtonElement;
++    submit.type = 'button';
++    submit.textContent = '配置';
++    submit.addEventListener('click', () => {
++      void this.#addRule();
++    });
++
 +    this.#ensureListening();
++    this.#render();
 +  }
 +
 +  override wasShown(): void {
@@ -218,7 +246,7 @@ index 00000000..4760141d
 +  }
 +
 +  cancel(): void {
-+    void this.#load();
++    this.#mask.classList.remove('show');
 +  }
 +
 +  targetAdded(target: SDK.Target.Target): void {
@@ -227,6 +255,15 @@ index 00000000..4760141d
 +
 +  targetRemoved(target: SDK.Target.Target): void {
 +    target.unregisterContextDispatcher(this.#dispatcher);
++  }
++
++  #limitInput(parent: HTMLElement, label: string, value: string): HTMLInputElement {
++    const field = parent.createChild('label', 'zz-cache-limit');
++    field.createChild('span').textContent = label;
++    const input = field.createChild('input') as HTMLInputElement;
++    input.type = 'text';
++    input.value = value;
++    return input;
 +  }
 +
 +  #ensureListening(): void {
@@ -242,42 +279,20 @@ index 00000000..4760141d
 +        SDK.NetworkManager.NetworkManager, SDK.NetworkManager.Events.RequestFinished, () => this.#flushPending(), this);
 +  }
 +
-+  #swatch(className: string, label: string): HTMLElement {
-+    const item = document.createElement('span');
-+    item.className = 'zz-cache-swatch ' + className;
-+    item.textContent = label;
-+    return item;
-+  }
-+
-+  #numberRow(label: string): HTMLInputElement {
-+    const row = this.element.createChild('label', 'zz-cache-number');
-+    const span = row.createChild('span');
-+    span.textContent = label;
-+    const input = row.createChild('input') as HTMLInputElement;
-+    input.type = 'text';
-+    input.spellcheck = false;
-+    return input;
-+  }
-+
-+  #targets(): SDK.Target.Target[] {
-+    return SDK.TargetManager.TargetManager.instance().targets();
-+  }
-+
-+  #agent(): ContextAgent | null {
-+    for (const target of this.#targets()) {
-+      try {
-+        const agent = target.contextAgent() as ContextAgent;
-+        if (agent) {
-+          return agent;
-+        }
-+      } catch {
-+      }
++  #agent(): ContextAgent|null {
++    const manager = SDK.TargetManager.TargetManager.instance();
++    const target = manager.scopeTarget() || manager.primaryPageTarget();
++    if (!target) {
++      return null;
 +    }
-+    return null;
++    try {
++      return target.contextAgent() as ContextAgent;
++    } catch {
++      return null;
++    }
 +  }
 +
 +  async #load(): Promise<void> {
-+    this.#error.textContent = '';
 +    const agent = this.#agent();
 +    if (!agent) {
 +      this.#error.textContent = '当前目标没有 Context 域。';
@@ -289,99 +304,309 @@ index 00000000..4760141d
 +      this.#error.textContent = error;
 +      return;
 +    }
-+    let rules: Record<string, unknown> = {};
-+    if (state.rules) {
-+      try {
-+        const parsed = JSON.parse(state.rules) as unknown;
-+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-+          rules = parsed as Record<string, unknown>;
-+        }
-+      } catch {
-+        this.#error.textContent = '现有 rules 不是 JSON 对象，打开后按空规则编辑。';
++    this.#dir = state.dir || '';
++    this.#map = state.map || '{}';
++    this.#readRules(state.rules || '');
++    this.#loaded = true;
++    this.#error.textContent = '';
++    this.#render();
++  }
++
++  #readRules(text: string): void {
++    this.#extra = {};
++    this.#rules = [];
++    if (!text) {
++      return;
++    }
++    let parsed: Record<string, unknown>;
++    try {
++      parsed = JSON.parse(text) as Record<string, unknown>;
++    } catch {
++      this.#error.textContent = '现有 rules 不是 JSON 对象。';
++      return;
++    }
++    const fallbackTtl = typeof parsed['ttl'] === 'number' ? parsed['ttl'] : 0;
++    const fallbackMax = typeof parsed['maxEntry'] === 'number' ? parsed['maxEntry'] : DEFAULT_MAX_ENTRY;
++    const fallbackStatus = Array.isArray(parsed['cacheableStatus']) ?
++        parsed['cacheableStatus'].filter(item => typeof item === 'number') as number[] :
++        [200];
++    for (const key of EXTRA_KEYS) {
++      if (Array.isArray(parsed[key])) {
++        this.#extra[key] = parsed[key];
 +      }
 +    }
-+    this.#baseRules = rules;
-+    for (const key of PATTERN_KEYS) {
-+      const row = this.#rows.get(key);
-+      if (!row) {
++    if (Array.isArray(parsed['items'])) {
++      this.#rules = this.#clean(parsed['items'], fallbackTtl, fallbackMax, fallbackStatus);
++      return;
++    }
++    let n = 0;
++    const add = (patterns: unknown, kind: RuleKind): void => {
++      if (!Array.isArray(patterns)) {
++        return;
++      }
++      for (const pattern of patterns) {
++        if (typeof pattern !== 'string' || !pattern.trim()) {
++          continue;
++        }
++        this.#rules.push({
++          id: String(Date.now()) + n,
++          pattern: pattern.trim(),
++          kind,
++          enabled: true,
++          ttl: fallbackTtl,
++          maxEntry: fallbackMax,
++          cacheableStatus: fallbackStatus.slice(),
++        });
++        n += 1;
++      }
++    };
++    add(parsed['include'], 'include');
++    add(parsed['exclude'], 'exclude');
++  }
++
++  #clean(items: unknown[], ttl: number, maxEntry: number, statuses: number[]): RuleItem[] {
++    const rules: RuleItem[] = [];
++    for (const item of items) {
++      if (!item || typeof item !== 'object') {
 +        continue;
 +      }
-+      const value = rules[key];
-+      const list = Array.isArray(value) ? value.filter(item => typeof item === 'string') as string[] : null;
-+      row.enabled.checked = !!list;
-+      row.text.value = list ? list.join('\n') : '';
++      const record = item as {
++        pattern?: unknown,
++        kind?: unknown,
++        enabled?: unknown,
++        id?: unknown,
++        ttl?: unknown,
++        maxEntry?: unknown,
++        cacheableStatus?: unknown,
++      };
++      if (record.kind !== 'include' && record.kind !== 'exclude') {
++        continue;
++      }
++      const value = String(record.pattern || '').trim();
++      if (!value) {
++        continue;
++      }
++      rules.push({
++        id: String(record.id || Date.now() + rules.length),
++        pattern: value,
++        kind: record.kind,
++        enabled: record.enabled !== false,
++        ttl: typeof record.ttl === 'number' ? record.ttl : ttl,
++        maxEntry: typeof record.maxEntry === 'number' ? record.maxEntry : maxEntry,
++        cacheableStatus: Array.isArray(record.cacheableStatus) ?
++            record.cacheableStatus.filter(code => typeof code === 'number') as number[] :
++            statuses.slice(),
++      });
 +    }
-+    this.#ttl.value = rules['ttl'] === undefined || rules['ttl'] === null ? '' : String(rules['ttl']);
-+    this.#maxEntry.value =
-+        rules['maxEntry'] === undefined || rules['maxEntry'] === null ? '' : String(rules['maxEntry']);
-+    const statuses = rules['cacheableStatus'];
-+    this.#status.value = Array.isArray(statuses) ? statuses.join(',') : '';
++    return rules;
 +  }
 +
-+  #patterns(text: string): string[] {
-+    return text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
++  #render(): void {
++    this.#list.innerHTML = '';
++    this.#empty.style.display = this.#rules.length ? 'none' : 'block';
++    const enabledCount = this.#rules.filter(rule => rule.enabled).length;
++    this.#selectAll.checked = this.#rules.length > 0 && enabledCount === this.#rules.length;
++    this.#selectAll.indeterminate = enabledCount > 0 && enabledCount < this.#rules.length;
++    this.#selectAll.disabled = this.#rules.length === 0;
++    this.#deleteSelected.disabled = enabledCount === 0;
++    for (const rule of this.#rules) {
++      const row = this.#list.createChild('div', 'zz-cache-rule' + (rule.enabled ? '' : ' off'));
++      const box = row.createChild('input') as HTMLInputElement;
++      box.type = 'checkbox';
++      box.checked = rule.enabled;
++      box.title = '使用这条规则';
++      box.addEventListener('change', () => {
++        rule.enabled = box.checked;
++        void this.#commit();
++      });
++      const tag = row.createChild('span', 'zz-cache-tag ' + rule.kind);
++      tag.textContent = rule.kind;
++      const body = row.createChild('div', 'zz-cache-body');
++      const text = body.createChild('div', 'zz-cache-pattern');
++      text.textContent = rule.pattern;
++      const meta = body.createChild('div', 'zz-cache-meta');
++      meta.textContent = 'ttl ' + rule.ttl + ' · maxEntry ' + rule.maxEntry + ' · status ' +
++          (rule.cacheableStatus.length ? rule.cacheableStatus.join(',') : '全部 2xx');
++      const remove = row.createChild('button', 'zz-cache-row-delete') as HTMLButtonElement;
++      remove.type = 'button';
++      remove.textContent = '删除';
++      remove.addEventListener('click', () => {
++        this.#rules = this.#rules.filter(item => item.id !== rule.id);
++        void this.#commit();
++      });
++    }
 +  }
 +
-+  async #apply(): Promise<void> {
-+    this.#error.textContent = '';
++  #openDialog(): void {
++    this.#pattern.value = '';
++    this.#kind.value = 'include';
++    this.#ttl.value = '0';
++    this.#maxEntry.value = String(DEFAULT_MAX_ENTRY);
++    this.#statuses.value = '200';
++    this.#limitError.textContent = '';
++    this.#mask.classList.add('show');
++    this.#pattern.focus();
++  }
++
++  #readNumber(input: HTMLInputElement): number|null {
++    const text = input.value.trim();
++    if (text === '') {
++      return 0;
++    }
++    if (!/^\d+$/.test(text)) {
++      return null;
++    }
++    return Number(text);
++  }
++
++  #readLimits(): {ttl: number, maxEntry: number, statuses: number[]}|null {
++    const ttl = this.#readNumber(this.#ttl);
++    const maxEntry = this.#readNumber(this.#maxEntry);
++    if (ttl === null || maxEntry === null) {
++      this.#limitError.textContent = 'ttl 和 maxEntry 要是非负整数。';
++      return null;
++    }
++    const statusText = this.#statuses.value.trim();
++    let statuses: number[] = [];
++    if (statusText) {
++      const parts = statusText.split(',').map(part => part.trim()).filter(Boolean);
++      if (!parts.length || parts.some(part => !/^\d+$/.test(part))) {
++        this.#limitError.textContent = 'cacheableStatus 要是逗号分隔的状态码。';
++        return null;
++      }
++      statuses = parts.map(Number);
++    }
++    this.#limitError.textContent = '';
++    return {ttl, maxEntry, statuses};
++  }
++
++  async #addRule(): Promise<void> {
++    const value = this.#pattern.value.trim();
++    if (!value) {
++      this.#pattern.focus();
++      return;
++    }
++    const limits = this.#readLimits();
++    if (!limits) {
++      return;
++    }
++    this.#rules.push({
++      id: String(Date.now()),
++      pattern: value,
++      kind: this.#kind.value === 'exclude' ? 'exclude' : 'include',
++      enabled: true,
++      ttl: limits.ttl,
++      maxEntry: limits.maxEntry,
++      cacheableStatus: limits.statuses,
++    });
++    this.cancel();
++    await this.#commit();
++  }
++
++  async #toggleAll(enabled: boolean): Promise<void> {
++    for (const rule of this.#rules) {
++      rule.enabled = enabled;
++    }
++    await this.#commit();
++  }
++
++  async #deleteChecked(): Promise<void> {
++    this.#rules = this.#rules.filter(rule => !rule.enabled);
++    await this.#commit();
++  }
++
++  #rulesObject(): Record<string, unknown> {
++    const body: Record<string, unknown> = {};
++    const include = this.#rules.filter(rule => rule.enabled && rule.kind === 'include').map(rule => rule.pattern);
++    const exclude = this.#rules.filter(rule => rule.enabled && rule.kind === 'exclude').map(rule => rule.pattern);
++    if (include.length) {
++      body['include'] = include;
++    }
++    if (exclude.length) {
++      body['exclude'] = exclude;
++    }
++    for (const key of EXTRA_KEYS) {
++      if (Array.isArray(this.#extra[key]) && (this.#extra[key] as unknown[]).length) {
++        body[key] = this.#extra[key];
++      }
++    }
++    body['items'] = this.#rules.map(rule => ({
++                                   pattern: rule.pattern,
++                                   kind: rule.kind,
++                                   enabled: rule.enabled,
++                                   ttl: rule.ttl,
++                                   maxEntry: rule.maxEntry,
++                                   cacheableStatus: rule.cacheableStatus,
++                                 }));
++    return body;
++  }
++
++  async #commit(): Promise<void> {
++    this.#render();
 +    const agent = this.#agent();
 +    if (!agent) {
 +      this.#error.textContent = '当前目标没有 Context 域。';
 +      return;
 +    }
-+    const rules: Record<string, unknown> = {...this.#baseRules};
-+    for (const key of PATTERN_KEYS) {
-+      const row = this.#rows.get(key);
-+      if (!row) {
-+        continue;
-+      }
-+      if (!row.enabled.checked) {
-+        delete rules[key];
-+        continue;
-+      }
-+      const patterns = this.#patterns(row.text.value);
-+      if (!patterns.length) {
-+        this.#error.textContent = key + ' 已勾选，但没有匹配。';
-+        return;
-+      }
-+      rules[key] = patterns;
-+    }
-+    const ttl = this.#ttl.value.trim();
-+    rules['ttl'] = ttl === '' ? 0 : Number(ttl);
-+    const maxEntry = this.#maxEntry.value.trim();
-+    rules['maxEntry'] = maxEntry === '' ? 0 : Number(maxEntry);
-+    if (!Number.isFinite(rules['ttl'] as number) || !Number.isFinite(rules['maxEntry'] as number)) {
-+      this.#error.textContent = 'ttl 和 maxEntry 要是数字。';
-+      return;
-+    }
-+    const statusText = this.#status.value.trim();
-+    if (statusText) {
-+      const statuses = statusText.split(',').map(part => Number(part.trim())).filter(part => Number.isFinite(part));
-+      if (!statuses.length) {
-+        this.#error.textContent = 'cacheableStatus 要是逗号分隔的状态码。';
-+        return;
-+      }
-+      rules['cacheableStatus'] = statuses;
-+    } else {
-+      delete rules['cacheableStatus'];
-+    }
-+
 +    const fresh = await agent.invoke_getCacheState({});
 +    const freshError = fresh.getError?.();
 +    if (freshError) {
 +      this.#error.textContent = freshError;
 +      return;
 +    }
++    this.#dir = fresh.dir || this.#dir;
++    this.#map = fresh.map || this.#map;
 +    const set = await agent.invoke_setContextOverrides({
-+      cache: {dir: fresh.dir || '', map: fresh.map || '', rules: JSON.stringify(rules)},
++      cache: {dir: this.#dir, map: this.#map, rules: JSON.stringify(this.#rulesObject())},
 +    });
 +    const setError = set.getError?.();
 +    if (setError) {
 +      this.#error.textContent = setError;
 +      return;
 +    }
-+    this.#baseRules = rules;
++    this.#error.textContent = '';
 +    await this.#explain(agent);
++  }
++
++  #export(): void {
++    const params = {cache: {dir: this.#dir, map: this.#map, rules: JSON.stringify(this.#rulesObject())}};
++    const blob = new Blob([JSON.stringify(params, null, 2)], {type: 'application/json'});
++    const link = document.createElement('a');
++    link.href = URL.createObjectURL(blob);
++    link.download = 'cache-rules.json';
++    link.click();
++    URL.revokeObjectURL(link.href);
++  }
++
++  async #import(file: File): Promise<void> {
++    let data: unknown;
++    try {
++      data = JSON.parse(await file.text());
++    } catch {
++      this.#error.textContent = '这个文件不是 JSON。';
++      return;
++    }
++    if (!data || typeof data !== 'object') {
++      this.#error.textContent = '认不出缓存配置。';
++      return;
++    }
++    const record = data as {cache?: {dir?: unknown, map?: unknown, rules?: unknown}};
++    if (!record.cache || typeof record.cache !== 'object') {
++      this.#error.textContent = '需要 Context.setContextOverrides 的 cache 参数。';
++      return;
++    }
++    if (typeof record.cache.dir === 'string') {
++      this.#dir = record.cache.dir;
++    }
++    if (typeof record.cache.map === 'string') {
++      this.#map = record.cache.map;
++    } else if (record.cache.map && typeof record.cache.map === 'object') {
++      this.#map = JSON.stringify(record.cache.map);
++    }
++    const rulesText = typeof record.cache.rules === 'string' ? record.cache.rules : JSON.stringify(record.cache.rules || {});
++    this.#readRules(rulesText);
++    this.#loaded = true;
++    await this.#commit();
 +  }
 +
 +  async #explain(agent: ContextAgent): Promise<void> {
@@ -399,8 +624,7 @@ index 00000000..4760141d
 +      }
 +      const results = response.results || [];
 +      for (let n = 0; n < slice.length; ++n) {
-+        const action = results[n]?.action || 'pass';
-+        this.#paint(slice[n], action);
++        this.#paint(slice[n], results[n]?.action || 'pass');
 +      }
 +    }
 +  }
@@ -444,12 +668,6 @@ index 00000000..4760141d
 +  #paint(request: SDK.NetworkRequest.NetworkRequest, action: string): void {
 +    this.#logView.applyZzCacheAction(request, action);
 +  }
-+}
-+
-+export const ZZ_CACHE_ACTION_CLASSES = Object.values(ACTION_CLASS);
-+
-+export function zzCacheActionClass(action: string): string {
-+  return ACTION_CLASS[action] || '';
 +}
 diff --git a/front_end/panels/network/NetworkDataGridNode.ts b/front_end/panels/network/NetworkDataGridNode.ts
 index 8cc3d4bd..6c0f8a33 100644
@@ -567,100 +785,196 @@ index 8ac9751b..3cf10c0b 100644
  
 diff --git a/front_end/panels/network/cacheRulesView.css b/front_end/panels/network/cacheRulesView.css
 new file mode 100644
-index 00000000..fbfedd96
+index 00000000..7051aec8
 --- /dev/null
 +++ b/front_end/panels/network/cacheRulesView.css
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,187 @@
 +.zz-cache-rules {
-+  padding: 8px 10px 12px;
++  position: relative;
++  height: 100%;
 +  overflow: auto;
 +  font-size: 12px;
 +}
 +
-+.zz-cache-title {
-+  font-weight: 600;
-+  margin-bottom: 6px;
-+}
-+
-+.zz-cache-legend {
++.zz-cache-bar,
++.zz-cache-tools {
 +  display: flex;
 +  flex-wrap: wrap;
-+  gap: 4px;
-+  margin-bottom: 8px;
++  align-items: center;
++  gap: 8px;
++  padding: 8px;
 +}
 +
-+.zz-cache-swatch {
-+  border-radius: 3px;
-+  padding: 1px 6px;
++.zz-cache-bar {
++  border-bottom: 1px solid var(--sys-color-divider);
 +}
 +
-+.zz-cache-hint {
-+  color: var(--sys-color-on-surface-subtle);
-+  margin-bottom: 8px;
++.zz-cache-rules button,
++.zz-cache-rules select,
++.zz-cache-rules textarea {
++  font: inherit;
 +}
 +
-+.zz-cache-row,
-+.zz-cache-number {
-+  display: flex;
-+  flex-direction: column;
-+  gap: 2px;
-+  margin-bottom: 8px;
++.zz-cache-rules button {
++  border: 1px solid var(--sys-color-divider);
++  background: var(--sys-color-cdt-base-container);
++  border-radius: 4px;
++  padding: 4px 8px;
++  cursor: pointer;
 +}
 +
-+.zz-cache-row-head {
++.zz-cache-add {
++  border-color: var(--sys-color-primary) !important;
++  background: var(--sys-color-primary) !important;
++  color: var(--sys-color-on-primary);
++}
++
++.zz-cache-danger {
++  color: var(--sys-color-error);
++}
++
++.zz-cache-check {
 +  display: flex;
 +  align-items: center;
-+  gap: 6px;
-+  font-family: monospace;
++  gap: 4px;
 +}
 +
-+.zz-cache-row textarea,
-+.zz-cache-number input {
-+  width: 100%;
-+  box-sizing: border-box;
-+  font-family: monospace;
-+  font-size: 11px;
++.zz-cache-file {
++  display: none;
 +}
 +
 +.zz-cache-error {
 +  min-height: 16px;
++  padding: 0 8px;
 +  color: var(--sys-color-error);
-+  margin-bottom: 6px;
 +}
 +
-+.zz-cache-buttons {
++.zz-cache-empty {
++  margin: 24px 8px;
++  color: var(--sys-color-on-surface-subtle);
++  text-align: center;
++}
++
++.zz-cache-list {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  padding: 0 8px 12px;
++}
++
++.zz-cache-rule {
++  display: flex;
++  align-items: flex-start;
++  gap: 6px;
++  border: 1px solid var(--sys-color-divider);
++  border-radius: 4px;
++  padding: 6px;
++}
++
++.zz-cache-rule.off {
++  opacity: 0.55;
++}
++
++.zz-cache-pattern {
++  flex: 1;
++  word-break: break-all;
++  font-family: monospace;
++}
++
++.zz-cache-tag {
++  border-radius: 3px;
++  padding: 0 4px;
++}
++
++.zz-cache-tag.include {
++  background: #ddf4e4;
++  color: #137333;
++}
++
++.zz-cache-tag.exclude {
++  background: #ffe1e1;
++  color: #c5221f;
++}
++
++.zz-cache-row-delete {
++  border: 0 !important;
++  background: transparent !important;
++  color: var(--sys-color-error);
++  padding: 0 2px !important;
++}
++
++.zz-cache-mask {
++  display: none;
++  position: absolute;
++  inset: 0;
++  background: rgba(0, 0, 0, 0.35);
++  align-items: center;
++  justify-content: center;
++  padding: 12px;
++}
++
++.zz-cache-mask.show {
++  display: flex;
++}
++
++.zz-cache-dialog {
++  width: 100%;
++  background: var(--sys-color-cdt-base-container);
++  border-radius: 6px;
++  padding: 12px;
++}
++
++.zz-cache-dialog-title {
++  font-weight: 600;
++  margin-bottom: 8px;
++}
++
++.zz-cache-dialog-row {
 +  display: flex;
 +  gap: 8px;
 +}
 +
-+.zz-cache-buttons button {
-+  padding: 4px 12px;
++.zz-cache-dialog-row textarea {
++  flex: 1;
++  min-height: 72px;
++  font-family: monospace;
 +}
 +
-+.zz-cache-hit,
-+.zz-cache-html {
-+  background: #d8f3dc;
++.zz-cache-dialog-row select {
++  width: 110px;
 +}
 +
-+.zz-cache-store {
-+  background: #ffe8c2;
++.zz-cache-dialog-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 8px;
 +}
 +
-+.zz-cache-block {
-+  background: #ffd6d6;
++.zz-cache-limits {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  margin-top: 8px;
 +}
 +
-+.zz-cache-allow-miss {
-+  background: #e6e6e6;
++.zz-cache-limit {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
 +}
 +
-+.zz-cache-observe {
-+  background: #d6e8ff;
++.zz-cache-limit input {
++  font-family: monospace;
 +}
 +
-+.zz-cache-capture,
-+.zz-cache-callback {
-+  background: #eadbff;
++.zz-cache-body {
++  flex: 1;
++  min-width: 0;
++}
++
++.zz-cache-meta {
++  color: var(--sys-color-on-surface-subtle);
 +}
 diff --git a/front_end/panels/network/networkLogView.css b/front_end/panels/network/networkLogView.css
 index ab38455d..6982901e 100644

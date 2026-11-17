@@ -1,19 +1,23 @@
-# Network 面板缓存规则
+# Chromium 151.0.7907.0 Windows 组件构建
 
-这次只备份缓存规则相关的源码。编译产物在服务器上：
+基线 `fdadfe85a4cf993308b77a9324bd31b79df69ba3`。这版包含第一次 release 的指纹、Context、WebRTC，第二次 release 的缓存规则，以及两条代理都生效的改法：`Context.setContextOverrides.proxy` 和 `Target.createBrowserContext` 的 `proxyServer`（地址只用 `http://host:port`，账号不要写进 URL）。
 
-`/root/src/chromium/src/out/Release/chrome`
-
-生成时间 2026-10-29 05:50 UTC。没有覆盖正在给其他服务用的这份：
-
-`/root/work/release/chromium-linux-x64-v151.0.7907.0-android-surface/chrome`
+产物是 Windows 组件构建，`chrome.exe` 在 `out/Default`。发布包见本仓库的 Release，不进 git。没有替换 Linux 上正在给服务用的浏览器。
 
 ## 补丁
 
-- `protocol_config.patch`：让 `Context` 域生成 `getCacheState`、`explainCache`、`cacheDecision`。打在 Chromium 源码根目录。
-- `devtools-frontend.patch`：Network 面板的缓存规则栏和 URL 上色。打在 `third_party/devtools-frontend/src`。
-- `chromium-new-files.patch`：`Context` 协议和请求拦截器的当前全文。这些文件在 Chromium 仓库里原本是未跟踪文件，所以这里是 `/dev/null` 对比，不是相对上一次提交的增量。打在 Chromium 源码根目录。
+三个补丁都相对上面的基线，用 `git apply`：
 
-## 行为
+- `chromium.patch`：打在 Chromium 源码根目录。含新增的 `context_handler`、`context_proxy_support`、`context_request_interceptor` 和 `Context.pdl`。
+- `devtools-frontend.patch`：打在 `third_party/devtools-frontend/src`。
+- `webrtc.patch`：打在 `third_party/webrtc`。
 
-Network 工具栏打开「缓存规则」。include、exclude、captures、callbacks、blocks、allowMiss、observe 各有输入框和勾选。应用后按内核裁决给左侧 URL 上色：命中为绿，写入为琥珀，拦截为红，观察为蓝，捕获和回调为紫。未勾选的键不会写进规则。应用只提交 `cache`，不改指纹、代理和 cookie。
+## 这台机器上的回归
+
+2026-11-17，96 线程编完，`ninja` 退出码 0。
+
+- reese：通过。直连出口是编译机自己的地址，`set.proxy` 后出口换成了代理地址。
+- kasada：通过。
+- 阿里滑块：通过。
+- `website` 里的 Context 冒烟、Android surface、缓存命中：通过。`proxyServer` 必须是不带账号的 `http://host:port`，账号由代理认证单独给。把账号写进 URL 会得到 `ERR_NO_SUPPORTED_PROXIES`。
+- `verify.py` 只缺 WebGL2 的 `EXT_texture_norm16`。headless / SwiftShader 本身没有这个扩展，交集之后少这一项是预期结果。
