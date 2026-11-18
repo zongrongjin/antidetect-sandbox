@@ -1,0 +1,9 @@
+is_debug = false
+symbol_level = 0
+blink_symbol_level = 0
+is_component_build = true
+enable_nacl = false
+use_remoteexec = false
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+enable_widevine = true

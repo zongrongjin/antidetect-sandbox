@@ -16,6 +16,12 @@ Chromium 三个补丁相对基线 `fdadfe85`，用 `git apply`：
 
 `firefox.patch` 相对官方 Firefox 152.0.5 源码包，在解压后的 `firefox-152.0.5` 目录里 `git apply`。里面是第一版指纹、Context、WebRTC，加上 Linux 上已经改好的缓存，以及 Windows 缓存路径按 `\` 拼接。补丁在那棵官方基线上做过 `git apply --reverse --check`。
 
+别人从官方源码打出同一版浏览器：
+
+Chromium：检出 `fdadfe85`，`gclient sync` 之后，在三个目录分别 `git apply` 上面三份补丁。把 `chromium.args.gn` 写到 `out/Default/args.gn`，再 `gn gen out/Default` 和 `autoninja -C out/Default chrome mini_installer`。不要再叠开源仓库里拆开的 `fp_full.diff`。
+
+Firefox：解压官方 `firefox-152.0.5.source.tar.xz`，进入 `firefox-152.0.5`，执行 `git apply firefox.patch`，把 `firefox.mozconfig` 复制成 `mozconfig`，然后 `./mach build` 和 `./mach package`。安装包在 `obj-release/dist/firefox-152.0.5.en-US.win64.installer.exe`。
+
 ## 这台机器上的回归
 
 2026-11-17，96 线程编完，`ninja` 退出码 0。
