@@ -1,0 +1,1281 @@
+/* BROWSER_CONTEXT */
+import { RootBiDiModule } from "chrome://remote/content/webdriver-bidi/modules/RootBiDiModule.sys.mjs";
+
+const lazy = {};
+ChromeUtils.defineESModuleGetters(lazy, {
+  assert: "chrome://remote/content/shared/webdriver/Assert.sys.mjs",
+  NavigableManager:
+    "chrome://remote/content/shared/NavigableManager.sys.mjs",
+  pprint: "chrome://remote/content/shared/Format.sys.mjs",
+  RootMessageHandler:
+    "chrome://remote/content/shared/messagehandler/RootMessageHandler.sys.mjs",
+  UserContextManager:
+    "chrome://remote/content/shared/UserContextManager.sys.mjs",
+});
+
+const { TRANSPARENT_PROXY_RESOLVES_HOST } = Ci.nsIProxyInfo;
+
+// internalUserContextId -> { type, host, port, username, password }
+const gProxyByUserContext = new Map();
+
+// internalUserContextId -> { dir, map, rules, docUrl, docHtml }
+const gNetByUserContext = new Map();
+
+function nativePath(path) {
+  if (!path) {
+    return "";
+  }
+  if (Services.appinfo.OS === "WINNT") {
+    return String(path).replace(/\//g, "\\");
+  }
+  return String(path).replace(/\\/g, "/");
+}
+
+function joinPath(dir, rel) {
+  if (!rel) {
+    return nativePath(dir);
+  }
+  const child = String(rel);
+  if (
+    /^[A-Za-z]:[\\/]/.test(child) ||
+    child.startsWith("/") ||
+    child.startsWith("\\\\")
+  ) {
+    return nativePath(child);
+  }
+  const base = String(dir || "").replace(/[\\/]+$/, "");
+  return nativePath(base + "/" + child.replace(/^[\\/]+/, ""));
+}
+
+
+let gProxyService = null;
+function proxyService() {
+  if (!gProxyService) {
+    gProxyService = Cc[
+      "@mozilla.org/network/protocol-proxy-service;1"
+    ].getService(Ci.nsIProtocolProxyService);
+  }
+  return gProxyService;
+}
+
+const gFilter = {
+  QueryInterface: ChromeUtils.generateQI(["nsIProtocolProxyChannelFilter"]),
+  applyFilter(channel, defaultProxyInfo, callback) {
+    let pi = defaultProxyInfo;
+    try {
+      const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
+      const o = gProxyByUserContext.get(uid);
+      if (o) {
+        pi = proxyService().newProxyInfoWithAuth(
+          o.type,
+          o.host,
+          o.port,
+          o.username,
+          o.password,
+          "",
+          "",
+          TRANSPARENT_PROXY_RESOLVES_HOST,
+          -1,
+          null
+        );
+      }
+    } catch (e) {
+      pi = defaultProxyInfo;
+    }
+    callback.onProxyFilterResult(pi);
+  },
+};
+
+let gRegistered = false;
+function ensureRegistered() {
+  if (!gRegistered) {
+    proxyService().registerChannelFilter(gFilter, 0);
+    gRegistered = true;
+  }
+}
+
+function parseEndpoint(endpoint) {
+  let type = "http";
+  let rest = endpoint;
+  const m = /^([a-zA-Z0-9]+):\/\/(.*)$/.exec(endpoint);
+  if (m) {
+    const scheme = m[1].toLowerCase();
+    rest = m[2];
+    if (scheme === "socks5" || scheme === "socks") {
+      type = "socks";
+    } else if (scheme === "socks4") {
+      type = "socks4";
+    } else if (scheme === "https") {
+      type = "https";
+    } else {
+      type = "http";
+    }
+  }
+  const idx = rest.lastIndexOf(":");
+  return {
+    type,
+    host: rest.slice(0, idx),
+    port: parseInt(rest.slice(idx + 1), 10),
+  };
+}
+
+function globToRe(pat) {
+  let out = "^";
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i];
+    if (c === "*") {
+      out += "[\\s\\S]*";
+    } else if (c === "?") {
+      out += "[\\s\\S]";
+    } else {
+      out += c.replace(/[|\\{}()[\]^$+.]/g, "\\$&");
+    }
+  }
+  return new RegExp(out + "$");
+}
+
+function matchAny(url, pats) {
+  if (!pats || !pats.length) {
+    return false;
+  }
+  for (const pat of pats) {
+    if (!pat) {
+      continue;
+    }
+    if (pat === url || pat === "*") {
+      return true;
+    }
+    try {
+      if (globToRe(pat).test(url)) {
+        return true;
+      }
+    } catch (e) {
+      if (url.includes(pat)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function listFrom(rules, key) {
+  if (!rules || !Array.isArray(rules[key])) {
+    return [];
+  }
+  return rules[key].filter(x => typeof x === "string");
+}
+
+function patternHits(url, pat) {
+  if (!pat) {
+    return false;
+  }
+  if (pat === url || pat === "*") {
+    return true;
+  }
+  try {
+    return globToRe(pat).test(url);
+  } catch (e) {
+    return url.includes(pat);
+  }
+}
+
+function numFrom(obj, key, fallback) {
+  if (!obj || obj[key] == null || obj[key] === "") {
+    return fallback;
+  }
+  const n = Number(obj[key]);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function readStatuses(obj) {
+  const list = obj && obj.cacheableStatus;
+  if (!Array.isArray(list) || !list.length) {
+    return null;
+  }
+  const out = [];
+  for (const item of list) {
+    const n = Number(item);
+    if (Number.isFinite(n)) {
+      out.push(n);
+    }
+  }
+  return out.length ? out : null;
+}
+
+// First enabled include item whose pattern hits supplies the limits.
+// Otherwise the shared fields on rules are used.
+function limitsFor(url, rules) {
+  const limits = {
+    ttl: 0,
+    maxEntry: 10 * 1024 * 1024,
+    statuses: null,
+  };
+  if (!rules) {
+    return limits;
+  }
+  const items = Array.isArray(rules.items) ? rules.items : [];
+  for (const item of items) {
+    if (!item || item.kind !== "include" || item.enabled === false) {
+      continue;
+    }
+    if (!patternHits(url, item.pattern)) {
+      continue;
+    }
+    limits.ttl = numFrom(item, "ttl", 0);
+    limits.maxEntry = numFrom(item, "maxEntry", 10 * 1024 * 1024);
+    limits.statuses = readStatuses(item);
+    return limits;
+  }
+  limits.ttl = numFrom(rules, "ttl", 0);
+  limits.maxEntry = numFrom(rules, "maxEntry", 10 * 1024 * 1024);
+  limits.statuses = readStatuses(rules);
+  return limits;
+}
+
+function rulesActive(rules) {
+  if (!rules || typeof rules !== "object") {
+    return false;
+  }
+  for (const key of [
+    "include",
+    "exclude",
+    "captures",
+    "callbacks",
+    "blocks",
+    "allowMiss",
+    "observe",
+    "items",
+  ]) {
+    if (Array.isArray(rules[key]) && rules[key].length) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function looksLikeSha256Hex(s) {
+  return typeof s === "string" && /^[0-9a-fA-F]{64}$/.test(s);
+}
+
+function findHitEntry(index, key) {
+  if (!index || typeof index !== "object") {
+    return null;
+  }
+  if (index[key]) {
+    return index[key];
+  }
+  if (typeof key === "string" && key.startsWith("POST ")) {
+    const sp = key.lastIndexOf(" ");
+    if (sp > 5 && looksLikeSha256Hex(key.slice(sp + 1))) {
+      const alt = key.slice(0, sp);
+      if (index[alt]) {
+        return index[alt];
+      }
+    }
+  }
+  try {
+    const u = new URL(key);
+    if (u.hash) {
+      u.hash = "";
+      if (index[u.href]) {
+        return index[u.href];
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+function canonPath(u) {
+  u.hash = "";
+  let href = u.href;
+  if (href.endsWith("/")) {
+    href = href.slice(0, -1);
+  }
+  return href;
+}
+
+function documentUrlMatch(request, target) {
+  if (!target) {
+    return false;
+  }
+  if (request === target) {
+    return true;
+  }
+  try {
+    const a = new URL(request);
+    const b = new URL(target);
+    if (canonPath(a) === canonPath(b)) {
+      return true;
+    }
+    // Firefox https-first upgrades http:// → https:// before the channel opens.
+    if (
+      a.host === b.host &&
+      a.pathname === b.pathname &&
+      a.search === b.search
+    ) {
+      const schemes = new Set([a.protocol, b.protocol]);
+      if (schemes.has("http:") && schemes.has("https:")) {
+        return true;
+      }
+    }
+  } catch (e) {
+    return false;
+  }
+  return false;
+}
+
+function cacheExcluded(url, rules) {
+  const include = listFrom(rules, "include");
+  if (include.length && !matchAny(url, include)) {
+    return true;
+  }
+  return matchAny(url, listFrom(rules, "exclude"));
+}
+
+function entryExpired(entry, url, rules) {
+  const ttl = limitsFor(url, rules).ttl;
+  if (ttl <= 0 || !entry || entry.created_at == null) {
+    return false;
+  }
+  return Date.now() / 1000 - Number(entry.created_at) > ttl;
+}
+
+function matchAction(url, cacheKey, rules, index) {
+  if (matchAny(url, listFrom(rules, "captures"))) {
+    return "capture";
+  }
+  if (matchAny(url, listFrom(rules, "callbacks"))) {
+    return "callback";
+  }
+  const entry = findHitEntry(index, cacheKey);
+  if (entry && !cacheExcluded(url, rules) && !entryExpired(entry, url, rules)) {
+    return "hit";
+  }
+  if (matchAny(url, listFrom(rules, "blocks"))) {
+    return "block";
+  }
+  if (matchAny(url, listFrom(rules, "allowMiss"))) {
+    return "allow-miss";
+  }
+  if (matchAny(url, listFrom(rules, "observe"))) {
+    return "observe";
+  }
+  return "pass";
+}
+
+function sha256hex(str) {
+  const data = new TextEncoder().encode(str);
+  const hasher = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hasher.init(Ci.nsICryptoHash.SHA256);
+  hasher.update(data, data.length);
+  const raw = hasher.finish(false);
+  return Array.from(raw, (_, i) =>
+    ("0" + raw.charCodeAt(i).toString(16)).slice(-2)
+  ).join("");
+}
+
+function parseJsonObject(s, fallback) {
+  if (!s) {
+    return fallback;
+  }
+  if (typeof s === "object" && !Array.isArray(s)) {
+    return s;
+  }
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function skipHeader(name) {
+  const n = String(name).toLowerCase();
+  return n === "content-encoding" || n === "content-length" || n === "set-cookie";
+}
+
+function netState(uid) {
+  if (!gNetByUserContext.has(uid)) {
+    gNetByUserContext.set(uid, {
+      dir: "",
+      map: {},
+      rules: {},
+      docUrl: "",
+      docHtml: "",
+    });
+  }
+  return gNetByUserContext.get(uid);
+}
+
+async function loadDiskMap(dir) {
+  if (!dir) {
+    return {};
+  }
+  try {
+    const path = joinPath(dir, "_map.json");
+    const txt = await IOUtils.readUTF8(path);
+    return parseJsonObject(txt, {});
+  } catch (e) {
+    return {};
+  }
+}
+
+async function saveDiskMap(dir, map) {
+  if (!dir) {
+    return;
+  }
+  const path = joinPath(dir, "_map.json");
+  await IOUtils.makeDirectory(dir, { ignoreExisting: true });
+  await IOUtils.writeUTF8(path, JSON.stringify(map), { tmpPath: path + ".tmp" });
+}
+
+function serveOverride(channel, status, reason, headers, body) {
+  const replaced = Cc[
+    "@mozilla.org/network/replaced-http-response;1"
+  ].createInstance(Ci.nsIReplacedHttpResponse);
+  replaced.init();
+  replaced.responseStatus = status;
+  replaced.responseStatusText = reason;
+  replaced.responseBody = body || "";
+  if (headers) {
+    for (const [name, value] of Object.entries(headers)) {
+      if (skipHeader(name) || value == null) {
+        continue;
+      }
+      replaced.setResponseHeader(String(name), String(value), true);
+    }
+  }
+  channel.QueryInterface(Ci.nsIHttpChannelInternal).setResponseOverride(replaced);
+}
+
+function readUploadBody(channel) {
+  try {
+    const upload = channel.QueryInterface(Ci.nsIUploadChannel);
+    const stream = upload.uploadStream;
+    if (!stream) {
+      return "";
+    }
+    const seek = stream.QueryInterface(Ci.nsISeekableStream);
+    const pos = seek.tell();
+    seek.seek(Ci.nsISeekableStream.NS_SEEK_SET, 0);
+    const sis = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+      Ci.nsIScriptableInputStream
+    );
+    sis.init(stream);
+    const available = sis.available();
+    const data = available ? sis.read(available) : "";
+    seek.seek(Ci.nsISeekableStream.NS_SEEK_SET, pos);
+    return data;
+  } catch (e) {
+    return "";
+  }
+}
+
+function cacheKey(method, url, body) {
+  const m = String(method || "GET").toUpperCase();
+  if (!m || m === "GET" || m === "HEAD") {
+    return url;
+  }
+  let key = m + " " + url;
+  if (body) {
+    key += " " + sha256hex(body);
+  }
+  return key;
+}
+
+function emitNet(kind, url) {
+  try {
+    Services.obs.notifyObservers(
+      null,
+      "zzbrowser-context-" + kind,
+      url
+    );
+  } catch (e) {}
+}
+
+function onModifyRequest(subject) {
+  let channel;
+  try {
+    channel = subject.QueryInterface(Ci.nsIHttpChannel);
+  } catch (e) {
+    return;
+  }
+  const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
+  const st = stateFor(uid);
+  if (!st) {
+    return;
+  }
+  let url;
+  try {
+    url = channel.URI.spec;
+  } catch (e) {
+    return;
+  }
+  if (st.docHtml && documentUrlMatch(url, st.docUrl)) {
+    markChannel(channel, "html");
+    serveOverride(
+      channel,
+      200,
+      "OK",
+      { "Content-Type": "text/html; charset=utf-8" },
+      st.docHtml
+    );
+    return;
+  }
+  const method = channel.requestMethod;
+  const key = cacheKey(method, url, readUploadBody(channel));
+  const action = matchAction(url, key, st.rules, st.map);
+  if (action === "callback") {
+    emitNet("callback", url);
+  } else if (action === "observe") {
+    emitNet("observe", url);
+  } else if (action === "capture") {
+    emitNet("capture", url);
+  }
+  if (
+    action === "callback" ||
+    action === "observe" ||
+    action === "capture" ||
+    action === "allow-miss"
+  ) {
+    markChannel(channel, action);
+  }
+  if (action === "hit") {
+    // Leave the body alone here. DevTools creates the Network row in
+    // http-on-before-connect, and the cached body is applied there.
+    // Bypass Firefox's own HTTP cache so a refresh is not swallowed as a
+    // disk-cache entry before that notification.
+    markChannel(channel, "hit");
+    try {
+      channel.loadFlags |=
+        Ci.nsIRequest.LOAD_BYPASS_CACHE | Ci.nsIRequest.INHIBIT_CACHING;
+    } catch (e) {}
+    return;
+  }
+  if (action === "block") {
+    markChannel(channel, "block");
+    try {
+      channel.cancel(Cr.NS_BINDING_ABORTED);
+    } catch (e) {
+      serveOverride(channel, 403, "Forbidden", {}, "");
+    }
+  }
+}
+
+function markChannel(channel, action) {
+  if (!action || action === "pass") {
+    return;
+  }
+  try {
+    channel
+      .QueryInterface(Ci.nsIWritablePropertyBag2)
+      .setPropertyAsAString("moz-context-cache-action", action);
+  } catch (e) {}
+}
+
+function readFileSync(path) {
+  try {
+    const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    file.initWithPath(path);
+    const fis = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
+      Ci.nsIFileInputStream
+    );
+    fis.init(file, 0x01, 0o444, 0);
+    const sis = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+      Ci.nsIScriptableInputStream
+    );
+    sis.init(fis);
+    const data = sis.read(sis.available());
+    sis.close();
+    fis.close();
+    return data;
+  } catch (e) {
+    return "";
+  }
+}
+
+function statusCacheable(status, rules, url) {
+  const statuses = limitsFor(url, rules).statuses;
+  if (statuses && statuses.length) {
+    return statuses.includes(status);
+  }
+  return status >= 200 && status < 300;
+}
+
+function shouldPersist(method, url, dir, action, rules) {
+  if (!dir) {
+    return false;
+  }
+  const m = String(method || "").toUpperCase();
+  if (m !== "GET" && m !== "POST") {
+    return false;
+  }
+  if (
+    action === "capture" ||
+    action === "callback" ||
+    action === "block" ||
+    action === "hit"
+  ) {
+    return false;
+  }
+  if (action === "allow-miss") {
+    return false;
+  }
+  if (cacheExcluded(url, rules)) {
+    return false;
+  }
+  return true;
+}
+
+function collectHeaders(channel) {
+  const headers = {};
+  try {
+    channel.visitResponseHeaders({
+      visitHeader(name, value) {
+        if (!skipHeader(name)) {
+          headers[name] = value;
+        }
+      },
+    });
+  } catch (e) {}
+  return headers;
+}
+
+function persistResponse(channel, st, url, method, action) {
+  if (!shouldPersist(method, url, st.dir, action, st.rules)) {
+    return;
+  }
+  let status = 200;
+  try {
+    status = channel.responseStatus;
+  } catch (e) {
+    return;
+  }
+  if (!statusCacheable(status, st.rules, url)) {
+    return;
+  }
+  const maxEntry = limitsFor(url, st.rules).maxEntry;
+  if (maxEntry > 0) {
+    let len = 0;
+    try {
+      len = Number(channel.getResponseHeader("content-length"));
+    } catch (e) {}
+    if (len > maxEntry) {
+      return;
+    }
+  }
+  markChannel(channel, "store");
+  let trace;
+  try {
+    trace = channel.QueryInterface(Ci.nsITraceableChannel);
+  } catch (e) {
+    return;
+  }
+  const hex = sha256hex(url);
+  const rel = hex.slice(0, 2) + "/" + hex;
+  const fullDir = joinPath(st.dir, hex.slice(0, 2));
+  try {
+    IOUtils.makeDirectory(fullDir, { ignoreExisting: true });
+  } catch (e) {}
+  const fullPath = joinPath(st.dir, rel);
+  const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+  try {
+    file.initWithPath(fullPath);
+    file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+  } catch (e) {}
+  const fos = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(
+    Ci.nsIFileOutputStream
+  );
+  try {
+    fos.init(file, 0x02 | 0x08 | 0x20, 0o644, 0);
+  } catch (e) {
+    return;
+  }
+  const tee = Cc["@mozilla.org/network/stream-listener-tee;1"].createInstance(
+    Ci.nsIStreamListenerTee
+  );
+  let old;
+  try {
+    old = trace.setNewListener(tee);
+  } catch (e) {
+    fos.close();
+    return;
+  }
+  const headers = collectHeaders(channel);
+  const created = Date.now() / 1000;
+  const observer = {
+    QueryInterface: ChromeUtils.generateQI(["nsIRequestObserver"]),
+    onStartRequest() {},
+    onStopRequest() {
+      try {
+        fos.close();
+      } catch (e) {}
+      st.map[url] = {
+        file: rel,
+        status,
+        headers,
+        created_at: created,
+      };
+      saveDiskMap(st.dir, st.map).catch(() => {});
+      if (action === "capture") {
+        emitNet("captured", url);
+      }
+    },
+  };
+  try {
+    tee.init(old, fos, observer);
+  } catch (e) {
+    try {
+      fos.close();
+    } catch (e2) {}
+  }
+}
+
+function replayHit(channel, st, url, key) {
+  const entry = findHitEntry(st.map, key);
+  if (!entry) {
+    return false;
+  }
+  markChannel(channel, "hit");
+  let body = "";
+  if (st.dir && entry.file) {
+    body = readFileSync(joinPath(st.dir, entry.file));
+  }
+  const status = Number(entry.status) || 200;
+  serveOverride(channel, status, "OK", entry.headers || {}, body);
+  return true;
+}
+
+function onBeforeConnect(subject) {
+  let channel;
+  try {
+    channel = subject.QueryInterface(Ci.nsIHttpChannel);
+  } catch (e) {
+    return;
+  }
+  const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
+  const st = stateFor(uid);
+  if (!st) {
+    return;
+  }
+  let url;
+  try {
+    url = channel.URI.spec;
+  } catch (e) {
+    return;
+  }
+  const method = channel.requestMethod;
+  const key = cacheKey(method, url, readUploadBody(channel));
+  if (matchAction(url, key, st.rules, st.map) !== "hit") {
+    return;
+  }
+  replayHit(channel, st, url, key);
+}
+
+function onExamineResponse(subject) {
+  let channel;
+  try {
+    channel = subject.QueryInterface(Ci.nsIHttpChannel);
+  } catch (e) {
+    return;
+  }
+  const uid = channel.loadInfo?.originAttributes?.userContextId ?? 0;
+  const st = stateFor(uid);
+  if (!st || !st.dir) {
+    return;
+  }
+  let url;
+  try {
+    url = channel.URI.spec;
+  } catch (e) {
+    return;
+  }
+  const method = channel.requestMethod;
+  const key = cacheKey(method, url, "");
+  const action = matchAction(url, key, st.rules, st.map);
+  persistResponse(channel, st, url, method, action);
+}
+
+function cacheRoot() {
+  const root = Services.dirsvc.get("ProfD", Ci.nsIFile);
+  root.append("context-cache");
+  return root;
+}
+
+function ensureContextDir(uid) {
+  const root = cacheRoot();
+  if (!root.exists()) {
+    root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+  }
+  const dir = root.clone();
+  dir.append(String(uid));
+  if (!dir.exists()) {
+    dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+  }
+  return dir.path;
+}
+
+function rulesFile(uid) {
+  const dir = cacheRoot();
+  dir.append(String(uid));
+  dir.append("context_cache.json");
+  return dir;
+}
+
+function writeFileSync(path, text) {
+  const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+  file.initWithPath(path);
+  const os = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(
+    Ci.nsIFileOutputStream
+  );
+  os.init(file, 0x02 | 0x08 | 0x20, 0o644, 0);
+  const cos = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(
+    Ci.nsIConverterOutputStream
+  );
+  cos.init(os, "UTF-8", 0, 0);
+  cos.writeString(text == null ? "" : String(text));
+  cos.close();
+}
+
+function loadMapSync(dir) {
+  if (!dir) {
+    return {};
+  }
+  return parseJsonObject(
+    readFileSync(joinPath(dir, "_map.json")),
+    {}
+  );
+}
+
+function loadSaved(uid) {
+  const file = rulesFile(uid);
+  if (!file.exists()) {
+    return null;
+  }
+  const saved = parseJsonObject(readFileSync(file.path), null);
+  if (!saved) {
+    return null;
+  }
+  const rules = parseJsonObject(saved.rules, {});
+  const dir = saved.dir || "";
+  return {
+    dir,
+    map: loadMapSync(dir),
+    rules,
+    docUrl: "",
+    docHtml: "",
+  };
+}
+
+function writeSaved(uid, dir, rules) {
+  const file = rulesFile(uid);
+  try {
+    if (!file.parent.exists()) {
+      file.parent.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+    }
+  } catch (e) {}
+  writeFileSync(file.path, JSON.stringify({ dir: dir || "", rules: rules || {} }));
+}
+
+function stateFor(uid) {
+  if (gNetByUserContext.has(uid)) {
+    return gNetByUserContext.get(uid);
+  }
+  const loaded = loadSaved(uid);
+  if (!loaded) {
+    return null;
+  }
+  gNetByUserContext.set(uid, loaded);
+  ensureNetHook();
+  return loaded;
+}
+
+export function readContextNet(uid) {
+  const st = stateFor(uid);
+  if (!st) {
+    return { dir: "", rules: {}, map: {} };
+  }
+  return { dir: st.dir || "", rules: st.rules || {}, map: st.map || {} };
+}
+
+export function writeContextNet(uid, cache) {
+  ensureNetHook();
+  const rules = parseJsonObject(
+    cache && cache.rules,
+    cache && cache.rules && typeof cache.rules === "object" ? cache.rules : {}
+  );
+  let dir = (cache && cache.dir) || "";
+  if (!dir && rulesActive(rules)) {
+    dir = ensureContextDir(uid);
+  }
+  const st = netState(uid);
+  st.dir = dir;
+  st.rules = rules;
+  const overlay = parseJsonObject(cache && cache.map, {});
+  st.map = Object.assign({}, loadMapSync(dir), st.map, overlay);
+  writeSaved(uid, dir, rules);
+  return readContextNet(uid);
+}
+
+let gNetHooked = false;
+function ensureNetHook() {
+  if (gNetHooked) {
+    return;
+  }
+  gNetHooked = true;
+  const obs = Services.obs;
+  obs.addObserver(onModifyRequest, "http-on-modify-request");
+  obs.addObserver(onBeforeConnect, "http-on-before-connect");
+  obs.addObserver(onExamineResponse, "http-on-examine-response");
+  obs.addObserver(onExamineResponse, "http-on-examine-cached-response");
+}
+
+function sameSiteValue(s) {
+  const Cookie = Ci.nsICookie;
+  if (s == null || s === "") {
+    return Cookie.SAMESITE_UNSET ?? Cookie.SAMESITE_LAX;
+  }
+  const u = String(s).toLowerCase();
+  if (u === "strict") {
+    return Cookie.SAMESITE_STRICT;
+  }
+  if (u === "none") {
+    return Cookie.SAMESITE_NONE;
+  }
+  return Cookie.SAMESITE_LAX;
+}
+
+function addCookies(internalId, cookies) {
+  const cm = Services.cookies;
+  const schemeHttps = Ci.nsICookie.SCHEME_HTTPS ?? 2;
+  for (const c of cookies) {
+    if (!c || !c.name) {
+      continue;
+    }
+    let host = c.domain || "";
+    let path = c.path || "/";
+    if (!host && c.url) {
+      try {
+        const u = new URL(c.url);
+        host = u.hostname;
+        path = c.path || u.pathname || "/";
+      } catch (e) {}
+    }
+    if (!host) {
+      continue;
+    }
+    if (host.startsWith(".")) {
+      // allowed for domain cookies
+    }
+    const isSession = c.expires == null;
+    const expiry = isSession
+      ? Date.now() + 86400 * 1000 * 365
+      : Number(c.expires) * 1000;
+    const originAttributes = { userContextId: internalId };
+    const schemeHttp = Ci.nsICookie.SCHEME_HTTP ?? 1;
+    const schemeMap = c.secure ? schemeHttps : schemeHttp | schemeHttps;
+    try {
+      cm.add(
+        host,
+        path,
+        c.name,
+        String(c.value ?? ""),
+        !!c.secure,
+        !!c.httpOnly,
+        isSession,
+        expiry,
+        originAttributes,
+        sameSiteValue(c.sameSite),
+        schemeMap,
+        false
+      );
+    } catch (e) {}
+  }
+}
+
+function navigateContexts(contextIds, userContextIds, url) {
+  if (!url) {
+    return;
+  }
+  const targets = [];
+  if (contextIds && contextIds.length) {
+    for (const id of contextIds) {
+      try {
+        const bc = lazy.NavigableManager.getBrowsingContextById(id);
+        if (bc) {
+          targets.push(bc);
+        }
+      } catch (e) {}
+    }
+  } else if (userContextIds && userContextIds.length) {
+    for (const bidiId of userContextIds) {
+      const internalId = lazy.UserContextManager.getInternalIdById(bidiId);
+      for (const win of Services.wm.getEnumerator("navigator:browser")) {
+        const tabs = win.gBrowser?.tabs || [];
+        for (const tab of tabs) {
+          const bc = tab.linkedBrowser?.browsingContext;
+          if (bc && bc.originAttributes.userContextId === internalId) {
+            targets.push(bc);
+          }
+        }
+      }
+    }
+  }
+  const uri = Services.io.newURI(url);
+  const principal = Services.scriptSecurityManager.getSystemPrincipal();
+  for (const bc of targets) {
+    try {
+      bc.loadURI(uri, {
+        triggeringPrincipal: principal,
+      });
+    } catch (e) {
+      try {
+        bc.fixupAndLoadURIString(url, { triggeringPrincipal: principal });
+      } catch (e2) {}
+    }
+  }
+}
+
+/**
+ * moz:context module (root). One setContextOverrides for fingerprint + proxy
+ * + cache + cookies + url/html. Fingerprint goes through
+ * _configuration/SessionData. Proxy uses nsIProtocolProxyChannelFilter.
+ * Cache HIT / fake html use nsIReplacedHttpResponse (HTTP/1.1, no network).
+ */
+class ContextModule extends RootBiDiModule {
+  constructor(messageHandler) {
+    super(messageHandler);
+  }
+
+  destroy() {}
+
+  /**
+   * @param {object=} params
+   * @param {string=} params.fingerprint  JSON string; omit to leave unchanged.
+   * @param {object=} params.proxy        {endpoint, username, password}
+   * @param {object=} params.cache        {dir, map, rules} — map/rules JSON strings
+   * @param {Array<object>=} params.cookies
+   * @param {string=} params.url
+   * @param {string=} params.html
+   * @param {Array<string>=} params.contexts
+   * @param {Array<string>=} params.userContexts
+   */
+  async setContextOverrides(params = {}) {
+    const {
+      fingerprint,
+      proxy,
+      cache,
+      cookies,
+      url,
+      html,
+      contexts: contextIds,
+      userContexts: userContextIds = [],
+    } = params;
+
+    if (fingerprint !== undefined) {
+      lazy.assert.string(
+        fingerprint,
+        lazy.pprint`Expected "fingerprint" to be a string, got ${fingerprint}`
+      );
+      await this.messageHandler.handleCommand({
+        moduleName: "_configuration",
+        commandName: "_applyConfigurationParameters",
+        destination: { type: lazy.RootMessageHandler.type },
+        params: {
+          async: false,
+          category: "fingerprint-override",
+          contextIds,
+          resetValue: "",
+          supportsGlobalConfiguration: true,
+          userContextIds,
+          value: fingerprint,
+        },
+      });
+    }
+
+    if (proxy !== undefined) {
+      if (proxy === null || typeof proxy !== "object" || Array.isArray(proxy)) {
+        throw new TypeError("Expected proxy to be an object");
+      }
+      const endpoint = proxy.endpoint ?? "";
+      const username = proxy.username ?? "";
+      const password = proxy.password ?? "";
+      lazy.assert.string(
+        endpoint,
+        lazy.pprint`Expected "proxy.endpoint" to be a string, got ${endpoint}`
+      );
+      ensureRegistered();
+      const parsed = endpoint ? parseEndpoint(endpoint) : null;
+      for (const bidiId of userContextIds) {
+        const internalId = lazy.UserContextManager.getInternalIdById(bidiId);
+        if (internalId === undefined || internalId === null) {
+          continue;
+        }
+        if (!parsed) {
+          gProxyByUserContext.delete(internalId);
+        } else {
+          gProxyByUserContext.set(internalId, {
+            type: parsed.type,
+            host: parsed.host,
+            port: parsed.port,
+            username,
+            password,
+          });
+        }
+      }
+    }
+
+    const netIds = [];
+    for (const bidiId of userContextIds) {
+      const internalId = lazy.UserContextManager.getInternalIdById(bidiId);
+      if (internalId === undefined || internalId === null) {
+        continue;
+      }
+      netIds.push(internalId);
+    }
+
+    if (cache !== undefined) {
+      if (cache === null || typeof cache !== "object" || Array.isArray(cache)) {
+        throw new TypeError("Expected cache to be an object");
+      }
+      ensureNetHook();
+      const overlay = parseJsonObject(cache.map, {});
+      const rules = parseJsonObject(cache.rules, {});
+      for (const uid of netIds) {
+        let dir = cache.dir ?? "";
+        if (!dir && rulesActive(rules)) {
+          dir = ensureContextDir(uid);
+        }
+        const disk = dir ? loadMapSync(dir) : {};
+        const st = netState(uid);
+        st.dir = dir;
+        st.map = Object.assign({}, disk, overlay);
+        st.rules = rules;
+        writeSaved(uid, dir, rules);
+      }
+    }
+
+    if (url !== undefined || html !== undefined) {
+      ensureNetHook();
+      const navUrl = url ?? "";
+      const navHtml = html ?? "";
+      for (const uid of netIds) {
+        const st = netState(uid);
+        st.docUrl = navUrl;
+        st.docHtml = navHtml;
+      }
+    }
+
+    if (cookies !== undefined) {
+      if (!Array.isArray(cookies)) {
+        throw new TypeError("Expected cookies to be an array");
+      }
+      for (const uid of netIds) {
+        addCookies(uid, cookies);
+      }
+    }
+
+    if (url) {
+      navigateContexts(contextIds, userContextIds, url);
+    }
+
+    return {};
+  }
+
+  async deepLocate(params = {}) {
+    const { selector, context: navigableId } = params;
+
+    lazy.assert.string(
+      selector,
+      lazy.pprint`Expected "selector" to be a string, got ${selector}`
+    );
+    lazy.assert.string(
+      navigableId,
+      lazy.pprint`Expected "context" to be a string, got ${navigableId}`
+    );
+
+    const context = this._getNavigable(navigableId);
+    const result = await this.#deepLocateRecursive(
+      context,
+      selector,
+      navigableId,
+      0,
+      0
+    );
+    return result || { found: false };
+  }
+
+  async #deepLocateRecursive(context, selector, bidiId, ox, oy) {
+    let res = null;
+    try {
+      res = await this._forwardToWindowGlobal(
+        "_deepLocate",
+        context.id,
+        { selector },
+        { retryOnAbort: true }
+      );
+    } catch (e) {
+      res = null;
+    }
+
+    if (res && res.found) {
+      const r = res.rect;
+      return {
+        found: true,
+        context: bidiId,
+        offset: { x: ox, y: oy },
+        local: r,
+        rect: {
+          x: ox + r.x,
+          y: oy + r.y,
+          width: r.width,
+          height: r.height,
+        },
+        node: res.node,
+      };
+    }
+
+    const children = context.children || [];
+    if (!children.length) {
+      return null;
+    }
+
+    let rects = [];
+    try {
+      const ir = await this._forwardToWindowGlobal(
+        "_iframeRects",
+        context.id,
+        {},
+        { retryOnAbort: true }
+      );
+      rects = (ir && ir.rects) || [];
+    } catch (e) {
+      rects = [];
+    }
+
+    for (let i = 0; i < children.length; i++) {
+      const io = rects[i] || { x: 0, y: 0 };
+      const childBidiId = lazy.NavigableManager.getIdForBrowsingContext(
+        children[i]
+      );
+      const found = await this.#deepLocateRecursive(
+        children[i],
+        selector,
+        childBidiId,
+        ox + io.x,
+        oy + io.y
+      );
+      if (found) {
+        return found;
+      }
+    }
+
+    return null;
+  }
+}
+
+export const context = ContextModule;
+
+ensureNetHook();
